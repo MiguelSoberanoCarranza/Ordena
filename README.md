@@ -4,6 +4,7 @@ Aplicación de escritorio para **Windows y macOS** que analiza una carpeta, prop
 
 - **Análisis local**: qué ocupa espacio por tipo, tamaño y antigüedad; duplicados exactos; archivos temporales; carpetas vacías.
 - **Explorar un disco completo**: analiza `C:\`, `Macintosh HD` o la carpeta de usuario entera y navega por las carpetas ordenadas por tamaño. Cada carpeta se etiqueta (sistema, aplicaciones, caché, usuario, juegos, desarrollo…) y las conocidas traen una explicación de qué son y cómo reducirlas. El botón **Explicar con IA** pide a MiniMax un plan concreto para ese nivel.
+- **Actualizaciones parciales y caché**: cada análisis se guarda en disco y se reabre en segundos desde "Análisis guardados". Al mover o borrar desde la app solo se releen las carpetas afectadas, y el botón "Actualizar esta carpeta" del explorador vuelve a leer únicamente esa carpeta y su contenido, sin recorrer el disco entero.
 - **Mover a otro disco**: copia una carpeta pesada (Vídeos, bibliotecas de juegos, Docker, copias de iPhone…) a otro disco, verifica la copia, borra el original y deja un enlace (junction en Windows, symlink en macOS) para que los programas la sigan encontrando. Reversible desde Historial.
 - **Organizar con IA**: MiniMax propone una estructura de carpetas y movimientos concretos. Tú revisas, marcas lo que quieres y aplicas. Todo se puede **deshacer** desde Historial.
 - **Liberar espacio con IA**: sugerencias con nivel de confianza (alta / media / baja) y motivo. Los archivos van a la **Papelera**, nunca se borran directamente.
@@ -40,9 +41,9 @@ Variables útiles durante el desarrollo:
 | Variable | Efecto |
 |---|---|
 | `MINIMAX_API_KEY` | Clave usada si no hay ninguna guardada en Ajustes |
-| `ORDENA_DEV_SCAN=/ruta` | Analiza esa carpeta al arrancar (`ORDENA_DEV_SCAN_MODE=disk` fuerza el modo disco) |
+| `ORDENA_DEV_SCAN=/ruta` | Analiza esa carpeta al arrancar (`ORDENA_DEV_SCAN_MODE=disk` fuerza el modo disco, `ORDENA_DEV_SCAN_CACHE=1` abre el análisis guardado) |
 | `ORDENA_DEV_VIEW=organize` | Muestra esa vista al arrancar |
-| `ORDENA_DEV_ACTION=organize\|cleanup\|dupes\|explain` | Dispara esa acción al arrancar |
+| `ORDENA_DEV_ACTION=organize\|cleanup\|dupes\|explain\|refresh` | Dispara esa acción al arrancar |
 | `ORDENA_SCREENSHOT=/ruta.png` | Captura la ventana y cierra (útil en CI) |
 
 ## Generar instaladores
@@ -66,7 +67,8 @@ git tag v0.1.0 && git push origin v0.1.0
 ```
 src/main/        proceso principal de Electron
   main.js        ventana, menú, IPC
-  scanner.js     recorrido de carpetas, tamaños por carpeta, resumen, duplicados (sha1 por tamaño → parcial → completo)
+  scanner.js     recorrido de carpetas, tamaños y categorías por carpeta, actualización incremental, duplicados
+  cache.js       análisis guardados (JSON comprimido en la carpeta de datos de la app)
   diskinfo.js    discos montados y espacio libre, base de conocimiento de rutas del sistema, rutas protegidas
   planner.js     prompts para MiniMax y validación de sus respuestas (rutas seguras, sin cambiar extensiones)
   minimax.js     cliente de la API compatible con OpenAI (Bearer, manejo de <think>, errores base_resp)

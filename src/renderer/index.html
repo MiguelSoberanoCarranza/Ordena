@@ -61,6 +61,13 @@
             <button class="btn btn-sm" id="btnCancelScan">Cancelar</button>
           </div>
         </div>
+        <div class="card drives-card" id="cachedCard" hidden>
+          <div class="row between">
+            <h3>Análisis guardados</h3>
+            <span class="small muted">Se abren en segundos y se mantienen al día con cada cambio que haces desde la app.</span>
+          </div>
+          <div id="cachedList"></div>
+        </div>
         <div class="card drives-card" id="drivesCard" hidden>
           <div class="row between">
             <h3>Discos del equipo</h3>
@@ -78,7 +85,7 @@
       <!-- ANALYSIS -->
       <section class="view" id="view-analysis">
         <div class="view-header">
-          <h2>Análisis de la carpeta</h2>
+          <div><h2>Análisis de la carpeta</h2><div class="small muted" id="analysisMeta"></div></div>
           <button class="btn" id="btnDupes">Buscar duplicados</button>
         </div>
         <div class="tiles" id="tiles"></div>
@@ -121,9 +128,11 @@
           </div>
           <div class="row gap">
             <button class="btn btn-ghost btn-sm" id="btnDiskUp">↑ Subir</button>
+            <button class="btn btn-sm" id="btnRefreshDir" title="Vuelve a leer solo esta carpeta y lo que contiene">↻ Actualizar esta carpeta</button>
             <button class="btn btn-primary" id="btnExplain">🤖 Explicar con IA</button>
           </div>
         </div>
+        <div class="progress" id="refreshProgress" hidden><div class="spinner"></div><div><span id="refreshText">Actualizando…</span> <span class="small muted path" id="refreshDir"></span></div></div>
         <div class="tiles" id="diskTiles"></div>
         <div class="card explain-card" id="explainCard" hidden>
           <div class="row between"><h3>Qué es y qué hacer</h3><button class="btn btn-ghost btn-sm" id="btnExplainClose">Ocultar</button></div>

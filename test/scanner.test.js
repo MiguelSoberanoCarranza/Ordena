@@ -85,8 +85,10 @@ test('disk mode aggregates directory sizes and keeps only large files', async ()
   assert.equal(sub.size, 3004);
   assert.equal(sub.fileCount, 2);
   assert.equal(scan.stats.largest[0].name, 'informe.pdf');
-  assert.equal(scan.stats.junkCount, 1);
-  assert.equal(scan.stats.categories[0].category, 'Imágenes');
+  const sum = summarize(scan);
+  assert.equal(sum.junkCount, 1);
+  assert.equal(sum.categories[0].category, 'Imágenes');
+  assert.equal(sum.categories.reduce((a, c) => a + c.bytes, 0), scan.totalSize);
 
   const { listChildren } = require('../src/main/scanner');
   const level = listChildren(scan, '');
@@ -96,5 +98,59 @@ test('disk mode aggregates directory sizes and keeps only large files', async ()
   assert.deepEqual(subLevel.crumbs.map((c) => c.rel), ['sub']);
   assert.equal(subLevel.files.length, 0); // small files not stored in disk mode
   assert.equal(listChildren(scan, 'nope'), null);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('incremental refresh keeps totals exact after deleting, adding and moving files', async () => {
+  const { removeSubtree, rescanSubtree, refreshDirShallow, refreshAffected } = require('../src/main/scanner');
+  const dir = makeFixture();
+  const scan = await scanDirectory(dir, { mode: 'disk', minStoreSize: 2000 });
+  const before = summarize(scan);
+
+  // 1) Delete a whole subfolder on disk, then refresh only its parent (shallow).
+  fs.rmSync(path.join(dir, 'sub'), { recursive: true });
+  await refreshDirShallow(scan, '');
+  let sum = summarize(scan);
+  assert.equal(sum.totalFiles, before.totalFiles - 2);
+  assert.equal(sum.totalSize, before.totalSize - 3004);
+  assert.equal(scan.dirs.find((d) => d.rel === 'sub'), undefined);
+  assert.equal(sum.categories.find((c) => c.category === 'Documentos'), undefined);
+
+  // 2) Add a new folder with a big file; shallow refresh of root must walk it fully.
+  fs.mkdirSync(path.join(dir, 'nueva', 'honda'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'nueva', 'honda', 'grande.mp4'), Buffer.alloc(9000, 7));
+  await refreshDirShallow(scan, '');
+  sum = summarize(scan);
+  assert.equal(scan.dirs.find((d) => d.rel === 'nueva/honda').size, 9000);
+  assert.equal(scan.dirs.find((d) => d.rel === 'nueva').size, 9000);
+  assert.equal(sum.totalSize, before.totalSize - 3004 + 9000);
+  assert.equal(sum.largest[0].name, 'grande.mp4');
+  assert.equal(sum.categories.find((c) => c.category === 'Videos').bytes, 9000);
+  assert.ok(scan.files.some((f) => f.rel === 'nueva/honda/grande.mp4'));
+
+  // 3) Move a root file into the new folder, refresh only the affected dirs.
+  fs.renameSync(path.join(dir, 'informe.pdf'), path.join(dir, 'nueva', 'informe.pdf'));
+  await refreshAffected(scan, ['informe.pdf', 'nueva/informe.pdf']);
+  sum = summarize(scan);
+  assert.equal(sum.totalSize, before.totalSize - 3004 + 9000);
+  assert.equal(scan.dirs.find((d) => d.rel === 'nueva').size, 14000);
+  assert.equal(scan.dirs.find((d) => d.rel === '').directFiles, 3);
+  assert.ok(scan.files.some((f) => f.rel === 'nueva/informe.pdf'));
+  assert.ok(!scan.files.some((f) => f.rel === 'informe.pdf'));
+
+  // 4) Full subtree rescan of one folder after changing a file size.
+  fs.writeFileSync(path.join(dir, 'nueva', 'honda', 'grande.mp4'), Buffer.alloc(1000, 7));
+  await rescanSubtree(scan, 'nueva');
+  sum = summarize(scan);
+  assert.equal(scan.dirs.find((d) => d.rel === 'nueva').size, 6000);
+  assert.equal(sum.totalSize, before.totalSize - 3004 + 1000);
+  assert.equal(sum.categories.reduce((a, c) => a + c.bytes, 0), sum.totalSize);
+
+  // 5) In-memory removal of a single file keeps categories consistent.
+  removeSubtree(scan, 'Thumbs.db');
+  sum = summarize(scan);
+  assert.equal(sum.junkCount, 0);
+  assert.equal(sum.categories.reduce((a, c) => a + c.bytes, 0), sum.totalSize);
+  assert.equal(scan.dirs.find((d) => d.rel === '').directFiles, 2);
   fs.rmSync(dir, { recursive: true, force: true });
 });

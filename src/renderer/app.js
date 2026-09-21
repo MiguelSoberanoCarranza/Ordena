@@ -40,6 +40,17 @@ function fmtDate(ms) {
 
 function fmtInt(n) { return Number(n || 0).toLocaleString('es'); }
 
+function fmtAgo(iso) {
+  const ms = Date.now() - new Date(iso).getTime();
+  if (!Number.isFinite(ms)) return '';
+  const m = Math.round(ms / 60000);
+  if (m < 1) return 'hace un momento';
+  if (m < 60) return `hace ${m} min`;
+  const h = Math.round(m / 60);
+  if (h < 48) return `hace ${h} h`;
+  return `hace ${Math.round(h / 24)} días`;
+}
+
 function pathHtml(rel) {
   const idx = rel.lastIndexOf('/');
   if (idx === -1) return `<span class="path">${esc(rel)}</span>`;
@@ -84,6 +95,7 @@ function showView(name) {
   $$('.nav-item').forEach((b) => b.classList.toggle('active', b.dataset.view === name));
   if (name === 'history') loadHistory();
   if (name === 'settings') loadSettingsForm();
+  if (name === 'disk' && !state.diskLevel && state.summary) loadDisk('');
 }
 
 function updateNavAvailability() {
@@ -179,17 +191,28 @@ $('#linkGetKey').addEventListener('click', (e) => {
 async function scanFolder(root, options = {}) {
   if (!root) return;
   let mode = options.mode;
+  let fromCache = Boolean(options.fromCache);
   try {
     const info = await ordena.targetInfo(root);
     if (!mode) mode = info.suggestedMode;
-    if (mode === 'disk' && !options.confirmed) {
+    const cached = options.fromCache || options.fresh ? null : await ordena.cachedScan(root).catch(() => null);
+    if (!options.confirmed && (cached || mode === 'disk')) {
+      const isBig = mode === 'disk';
+      const body = `
+        ${cached ? `<label class="open-option"><input type="radio" name="openMode" value="cache" checked />
+          <div><strong>Abrir el análisis guardado</strong> <span class="small">(${fmtAgo(cached.updatedAt)} · ${fmtInt(cached.totalFiles)} archivos · ${fmtBytes(cached.totalSize)})</span>
+          <div class="small">Instantáneo. Refleja los cambios hechos desde Ordena; lo que hayas cambiado por fuera se actualiza con "Actualizar esta carpeta" o "Reanalizar".</div></div></label>` : ''}
+        <label class="open-option"><input type="radio" name="openMode" value="fresh" ${cached ? '' : 'checked'} />
+          <div><strong>Analizar de nuevo</strong>${isBig ? ' <span class="small">(puede tardar varios minutos, se puede cancelar)</span>' : ''}
+          <div class="small">Recorre <code>${esc(info.path)}</code> completo.${isBig ? ' Se calculan los tamaños de todas las carpetas y se guarda el detalle de los archivos de 1 MB o más. Las carpetas del sistema están protegidas.' : ''}</div></div></label>`;
       const ok = await confirmDialog({
-        title: info.isDriveRoot ? 'Analizar el disco completo' : 'Analizar toda la carpeta de usuario',
-        bodyHtml: `<p>Se recorrerán <strong>todas</strong> las carpetas de <code>${esc(info.path)}</code>. En un disco con muchos archivos puede tardar varios minutos; puedes cancelarlo en cualquier momento.</p>
-          <p class="small muted">En este modo Ordena calcula el tamaño de cada carpeta y guarda el detalle de los archivos de 1 MB o más, que son los que importan para liberar espacio. Las carpetas del sistema se muestran pero están protegidas: nunca se mueven ni se borran.</p>`,
-        okText: 'Analizar',
+        title: cached ? 'Ya hay un análisis de esta carpeta' : (info.isDriveRoot ? 'Analizar el disco completo' : 'Analizar toda la carpeta de usuario'),
+        bodyHtml: body,
+        okText: 'Continuar',
       });
       if (!ok) return;
+      fromCache = $('input[name="openMode"]:checked')?.value === 'cache';
+      if (cached && fromCache) mode = cached.mode;
     }
   } catch (err) {
     toast(err.message, 'error');
@@ -202,7 +225,7 @@ async function scanFolder(root, options = {}) {
   showView('home');
   setBusy(true);
   try {
-    const { summary, errors } = await ordena.scan(root, { mode });
+    const { summary, errors } = await ordena.scan(root, { mode, fromCache });
     state.root = root;
     state.summary = summary;
     state.duplicates = null;
@@ -221,7 +244,9 @@ async function scanFolder(root, options = {}) {
     renderAnalysis(errors);
     updateNavAvailability();
     if (summary.mode === 'disk') { await loadDisk(''); showView('disk'); } else showView('analysis');
+    renderCached();
     if (summary.cancelled) toast('Análisis cancelado: se muestran los datos recogidos hasta ahora.', 'error');
+    else if (fromCache) toast(`Análisis guardado abierto (datos de ${fmtAgo(summary.updatedAt)})`, 'ok');
     else if (summary.truncated) toast(summary.mode === 'disk' ? 'Hay tantos archivos grandes que solo se guardó el detalle de los primeros 250 000.' : 'La carpeta es muy grande: se analizaron los primeros 60 000 archivos.', 'error');
   } catch (err) {
     toast(err.message, 'error');
@@ -232,10 +257,38 @@ async function scanFolder(root, options = {}) {
 }
 
 ordena.onScanProgress((p) => {
+  if (p.partial) {
+    $('#refreshText').textContent = `Actualizando… ${fmtInt(p.files)} archivos · ${fmtBytes(p.bytes)}`;
+    if (p.current) $('#refreshDir').textContent = p.current;
+    return;
+  }
   $('#scanProgressText').textContent = `${fmtInt(p.files)} archivos · ${fmtBytes(p.bytes)}`;
   if (p.current) $('#scanProgressDir').textContent = p.current;
 });
 $('#btnCancelScan').addEventListener('click', () => { ordena.cancelScan(); $('#btnCancelScan').textContent = 'Cancelando…'; });
+
+async function renderCached() {
+  let list = [];
+  try { list = await ordena.cachedScans(); } catch { list = []; }
+  const card = $('#cachedCard');
+  if (!list.length) { card.hidden = true; return; }
+  card.hidden = false;
+  $('#cachedList').innerHTML = list.slice(0, 8).map((m) => `
+    <div class="cached">
+      <div>
+        <div class="cached-path">${esc(m.root)}</div>
+        <div class="cached-meta">${m.mode === 'disk' ? 'Disco completo' : 'Carpeta'} · ${fmtInt(m.totalFiles)} archivos · ${fmtBytes(m.totalSize)} · actualizado ${fmtAgo(m.updatedAt)}</div>
+      </div>
+      <div class="row gap">
+        <button class="btn btn-primary btn-sm" data-open-cached="${esc(m.root)}" data-mode="${esc(m.mode)}">Abrir</button>
+        <button class="btn btn-ghost btn-sm" data-rescan-cached="${esc(m.root)}" data-mode="${esc(m.mode)}">Reanalizar</button>
+        <button class="btn btn-ghost btn-sm" data-forget-cached="${esc(m.root)}" title="Borrar el análisis guardado">✕</button>
+      </div>
+    </div>`).join('');
+  $$('[data-open-cached]').forEach((b) => b.addEventListener('click', () => scanFolder(b.dataset.openCached, { mode: b.dataset.mode, fromCache: true, confirmed: true })));
+  $$('[data-rescan-cached]').forEach((b) => b.addEventListener('click', () => scanFolder(b.dataset.rescanCached, { mode: b.dataset.mode, fresh: true, confirmed: true })));
+  $$('[data-forget-cached]').forEach((b) => b.addEventListener('click', async () => { await ordena.forgetCached(b.dataset.forgetCached).catch(() => {}); renderCached(); }));
+}
 
 async function renderDrives() {
   try {
@@ -261,11 +314,18 @@ async function renderDrives() {
 
 $('#btnPick').addEventListener('click', async () => scanFolder(await ordena.pickFolder()));
 $('#btnChangeFolder').addEventListener('click', async () => scanFolder(await ordena.pickFolder()));
-$('#btnRescan').addEventListener('click', () => scanFolder(state.root));
+$('#btnRescan').addEventListener('click', () => scanFolder(state.root, { mode: state.summary?.mode, fresh: true, confirmed: true }));
 ordena.onMenuOpenFolder(async () => scanFolder(await ordena.pickFolder()));
-ordena.onDevScan((p) => scanFolder(p.root, { mode: p.mode, confirmed: true }));
-ordena.onDevView((view) => { showView(view); if (view === 'disk' && !state.diskLevel && state.summary) loadDisk(''); });
-ordena.onDevAction((action) => { const b = { organize: '#btnOrganize', cleanup: '#btnCleanup', dupes: '#btnDupes', explain: '#btnExplain' }[action]; if (b) $(b).click(); });
+ordena.onDevScan((p) => scanFolder(p.root, { mode: p.mode, confirmed: true, fromCache: p.fromCache, fresh: !p.fromCache }));
+ordena.onDevView((view) => showView(view));
+ordena.onDevAction(async (action) => {
+  const map = { organize: ['organize', '#btnOrganize'], cleanup: ['cleanup', '#btnCleanup'], dupes: ['analysis', '#btnDupes'], explain: ['disk', '#btnExplain'], refresh: ['disk', '#btnRefreshDir'] };
+  const [view, sel] = map[action] || [];
+  if (!sel) return;
+  showView(view);
+  if (view === 'disk' && !state.diskLevel && state.summary) await loadDisk('');
+  $(sel).click();
+});
 
 async function renderQuickFolders() {
   const folders = await ordena.commonFolders();
@@ -307,6 +367,8 @@ function renderAnalysis(errors = []) {
   $('#ageBars').innerHTML = barsHtml(Object.entries(s.ageBuckets).map(([k, v]) => ({ label: k, value: v })), s.totalSize);
   $('#extChips').innerHTML = s.extensions.slice(0, 14).map((e) => `<span class="chip"><strong>.${esc(e.ext)}</strong> ${fmtBytes(e.bytes)} · ${fmtInt(e.count)}</span>`).join('');
 
+  $('#analysisMeta').textContent = s.updatedAt ? `Datos actualizados ${fmtAgo(s.updatedAt)}${s.scannedAt && s.scannedAt !== s.updatedAt ? ` · análisis completo ${fmtAgo(s.scannedAt)}` : ''}` : '';
+  $('#extChips').title = s.extensionsPartial ? 'Solo archivos de 1 MB o más' : '';
   const topDirsCard = $('#topDirsCard');
   if (s.topDirs && s.topDirs.length) {
     topDirsCard.hidden = false;
@@ -457,6 +519,34 @@ function renderDisk() {
 $('#btnDiskUp').addEventListener('click', () => {
   const rel = state.diskRel;
   loadDisk(rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : '');
+});
+
+$('#btnRefreshDir').addEventListener('click', async () => {
+  const rel = state.diskRel;
+  const level = state.diskLevel;
+  if (!level) return;
+  if (rel === '' && state.summary?.mode === 'disk') {
+    const ok = await confirmDialog({ title: '¿Actualizar todo el disco?', bodyHtml: '<p>Estás en la raíz: actualizar aquí equivale a reanalizar el disco completo y puede tardar varios minutos. Entra en una carpeta concreta para actualizar solo esa parte.</p>', okText: 'Actualizar todo' });
+    if (!ok) return;
+  }
+  $('#refreshProgress').hidden = false;
+  $('#refreshText').textContent = `Actualizando ${level.name}…`;
+  $('#refreshDir').textContent = '';
+  $('#btnRefreshDir').disabled = true;
+  try {
+    const res = await ordena.refresh(rel);
+    state.summary = res.summary;
+    state.duplicates = null;
+    for (const k of [...state.explanations.keys()]) if (k === rel || k.startsWith(`${rel}/`)) state.explanations.delete(k);
+    renderAnalysis();
+    if (res.removed) { toast('La carpeta ya no existe; se ha quitado del análisis.'); await loadDisk(rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : ''); }
+    else { await loadDisk(rel); toast(`Actualizado: ${fmtInt(res.files)} archivos · ${fmtBytes(res.bytes)}`, 'ok'); }
+  } catch (err) {
+    toast(err.message, 'error');
+  } finally {
+    $('#refreshProgress').hidden = true;
+    $('#btnRefreshDir').disabled = false;
+  }
 });
 
 $('#btnExplain').addEventListener('click', async () => {
@@ -924,6 +1014,7 @@ ordena.onOpsProgress((p) => {
   $('#appInfo').textContent = `Ordena ${info.version} · ${info.platform} · datos en ${info.userData}`;
   await refreshSettings();
   await renderQuickFolders();
+  await renderCached();
   await renderDrives();
   updateNavAvailability();
 })();

@@ -2,7 +2,8 @@
 
 const { app, BrowserWindow, ipcMain, dialog, shell, safeStorage, Menu, nativeTheme } = require('electron');
 const path = require('path');
-const { scanDirectory, summarize, findDuplicates, listChildren, removeSubtree } = require('./scanner');
+const { scanDirectory, summarize, findDuplicates, listChildren, removeSubtree, rescanSubtree, refreshAffected } = require('./scanner');
+const { ScanCache } = require('./cache');
 const planner = require('./planner');
 const minimax = require('./minimax');
 const { Journal, applyMoves, undoMoves, trashFiles, removeEmptyDirs, relocate, undoRelocate } = require('./operations');
@@ -27,6 +28,7 @@ const state = {
 
 const settings = new Settings({ file: path.join(app.getPath('userData'), 'settings.json'), safeStorage });
 const journal = new Journal(path.join(app.getPath('userData'), 'journal.json'));
+const cache = new ScanCache(path.join(app.getPath('userData'), 'scan-cache'));
 
 function send(channel, payload) {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, payload);
@@ -59,8 +61,8 @@ function createWindow() {
 
   // Developer hooks: ORDENA_DEV_SCAN=<carpeta> analiza al arrancar; ORDENA_SCREENSHOT=<png> captura y cierra.
   mainWindow.webContents.once('did-finish-load', async () => {
-    if (process.env.ORDENA_DEV_SCAN) send('dev:scan', { root: process.env.ORDENA_DEV_SCAN, mode: process.env.ORDENA_DEV_SCAN_MODE || undefined });
-    if (process.env.ORDENA_DEV_ACTION) setTimeout(() => send('dev:action', process.env.ORDENA_DEV_ACTION), 1200);
+    if (process.env.ORDENA_DEV_SCAN) send('dev:scan', { root: process.env.ORDENA_DEV_SCAN, mode: process.env.ORDENA_DEV_SCAN_MODE || undefined, fromCache: process.env.ORDENA_DEV_SCAN_CACHE === '1' });
+    if (process.env.ORDENA_DEV_ACTION) setTimeout(() => send('dev:action', process.env.ORDENA_DEV_ACTION), Number(process.env.ORDENA_DEV_ACTION_DELAY || 2500));
     if (process.env.ORDENA_SCREENSHOT) {
       const delay = Number(process.env.ORDENA_SCREENSHOT_DELAY || 2500);
       setTimeout(async () => {
@@ -147,6 +149,15 @@ async function runAi(messages, { maxTokens } = {}) {
   }
 }
 
+/** Recompute summary after an in-memory or on-disk change and persist the scan in the background. */
+function afterMutation() {
+  if (!state.scan) return null;
+  state.summary = summarize(state.scan);
+  state.duplicates = null;
+  cache.saveDebounced(state.scan);
+  return state.summary;
+}
+
 function serializeError(err) {
   return { message: err?.message || String(err), code: err?.code || null };
 }
@@ -195,12 +206,23 @@ function targetInfo(root) {
 handle('app:targetInfo', async (root) => targetInfo(root));
 handle('app:drives', async () => diskinfo.listDrives());
 
+handle('scan:cached', async (root) => (typeof root === 'string' && root ? cache.meta(root) : null));
+handle('scan:cachedList', async () => cache.list());
+handle('scan:forgetCached', async (root) => { await cache.remove(root); return true; });
+
 handle('scan:start', async (root, options = {}) => {
   if (typeof root !== 'string' || !root) throw new Error('Carpeta inválida');
   const info = targetInfo(root);
   const mode = options.mode === 'disk' || options.mode === 'folder' ? options.mode : info.suggestedMode;
   state.scan = null; state.summary = null; state.duplicates = null; state.organizePlan = null; state.cleanupPlan = null;
   state.scanCancel = false;
+  if (options.fromCache) {
+    send('scan:progress', { files: 0, bytes: 0, current: 'Cargando análisis guardado…' });
+    const scan = await cache.load(root);
+    state.scan = scan;
+    state.summary = summarize(scan);
+    return { summary: state.summary, errors: scan.errors.slice(0, 50), fromCache: true };
+  }
   const scan = await scanDirectory(root, {
     mode,
     onProgress: (p) => send('scan:progress', p),
@@ -208,7 +230,18 @@ handle('scan:start', async (root, options = {}) => {
   });
   state.scan = scan;
   state.summary = summarize(scan);
+  if (!scan.cancelled) cache.save(scan).catch((err) => console.error('[cache] save failed', err));
   return { summary: state.summary, errors: scan.errors.slice(0, 50) };
+});
+
+/** Re-scan only one folder (and everything below it) and splice it into the current analysis. */
+handle('scan:refresh', async (rel) => {
+  const scan = requireScan();
+  state.scanCancel = false;
+  const clean = String(rel || '');
+  const result = await rescanSubtree(scan, clean, { onProgress: (p) => send('scan:progress', { ...p, partial: true }), shouldCancel: () => state.scanCancel });
+  const summary = afterMutation();
+  return { ...result, summary };
 });
 
 handle('scan:cancel', async () => { state.scanCancel = true; return true; });
@@ -279,9 +312,7 @@ handle('ops:relocate', async (rel, destDir, options = {}) => {
     onProgress: (p) => send('ops:progress', { ...p, kind: 'relocate' }),
   });
   removeSubtree(scan, rel);
-  state.summary = summarize(scan);
-  state.duplicates = null;
-  return { ...result, summary: state.summary };
+  return { ...result, summary: afterMutation() };
 });
 
 handle('ops:trashPath', async (rel) => {
@@ -294,9 +325,7 @@ handle('ops:trashPath', async (rel) => {
   await shell.trashItem(abs);
   await journal.append({ id: require('crypto').randomUUID(), type: 'trash', root: scan.root, at: new Date().toISOString(), count: node ? node.fileCount : 1, bytes, entries: [{ path: rel }], undone: false });
   removeSubtree(scan, rel);
-  state.summary = summarize(scan);
-  state.duplicates = null;
-  return { bytes, summary: state.summary };
+  return { bytes, summary: afterMutation() };
 });
 
 handle('scan:duplicates', async () => {
@@ -360,29 +389,24 @@ handle('ops:applyMoves', async (moves) => {
   if (!Array.isArray(moves) || moves.length === 0) throw new Error('No hay movimientos seleccionados');
   const clean = moves.map((m) => ({ from: String(m.from), to: String(m.to) }));
   const result = await applyMoves(scan.root, clean, { journal, onProgress: (p) => send('ops:progress', p) });
-  // Refresh inventory so later actions see the new layout.
-  state.scan = await scanDirectory(scan.root);
-  state.summary = summarize(state.scan);
-  state.duplicates = null;
-  return { ...result, summary: state.summary };
+  // Refresh only the folders involved so later actions see the new layout.
+  await refreshAffected(scan, result.done.flatMap((m) => [m.from, m.to]));
+  return { ...result, summary: afterMutation() };
 });
 
 handle('ops:trash', async (paths) => {
   const scan = requireScan();
   if (!Array.isArray(paths) || paths.length === 0) throw new Error('No hay archivos seleccionados');
   const result = await trashFiles(scan.root, paths.map(String), { journal, trashImpl: (abs) => shell.trashItem(abs), onProgress: (p) => send('ops:progress', p) });
-  state.scan = await scanDirectory(scan.root);
-  state.summary = summarize(state.scan);
-  state.duplicates = null;
-  return { ...result, summary: state.summary };
+  for (const d of result.done) removeSubtree(scan, d.path);
+  return { ...result, summary: afterMutation() };
 });
 
 handle('ops:removeEmptyDirs', async (dirs) => {
   const scan = requireScan();
   const result = await removeEmptyDirs(scan.root, Array.isArray(dirs) ? dirs.map(String) : []);
-  state.scan = await scanDirectory(scan.root);
-  state.summary = summarize(state.scan);
-  return { ...result, summary: state.summary };
+  for (const d of result.done) removeSubtree(scan, d);
+  return { ...result, summary: afterMutation() };
 });
 
 handle('ops:journal', async () => (await journal.read()).slice().reverse());
@@ -394,14 +418,22 @@ handle('ops:undo', async (id) => {
   if (entry.undone) throw new Error('Esta operación ya fue deshecha');
   if (entry.type === 'relocate') {
     const r = await undoRelocate(entry, { journal, onProgress: (p) => send('ops:progress', { ...p, kind: 'relocate' }) });
-    return { restored: [{ from: entry.dest, to: r.restored }], failed: [], summary: state.summary, needsRescan: true };
+    let needsRescan = true;
+    if (state.scan) {
+      const relBack = path.relative(state.scan.root, r.restored);
+      if (relBack && !relBack.startsWith('..') && !path.isAbsolute(relBack)) {
+        await rescanSubtree(state.scan, relBack.split(path.sep).join('/'));
+        afterMutation();
+        needsRescan = false;
+      }
+    }
+    return { restored: [{ from: entry.dest, to: r.restored }], failed: [], summary: state.summary, needsRescan };
   }
   if (entry.type !== 'move') throw new Error('Los archivos enviados a la Papelera se recuperan desde la Papelera del sistema.');
   const result = await undoMoves(entry, { journal });
   if (state.scan && state.scan.root === entry.root) {
-    state.scan = await scanDirectory(entry.root);
-    state.summary = summarize(state.scan);
-    state.duplicates = null;
+    await refreshAffected(state.scan, result.restored.flatMap((m) => [m.from, m.to]));
+    afterMutation();
   }
   return { ...result, summary: state.summary };
 });
@@ -447,4 +479,13 @@ app.whenReady().then(() => {
 
 app.on('window-all-closed', () => {
   if (!isMac) app.quit();
+});
+
+// Make sure a pending (debounced) cache save is written before quitting.
+let flushing = false;
+app.on('before-quit', (event) => {
+  if (flushing || !cache.hasPending()) return;
+  event.preventDefault();
+  flushing = true;
+  cache.flush().finally(() => app.quit());
 });

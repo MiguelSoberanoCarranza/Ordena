@@ -11,7 +11,7 @@ const DEFAULTS = {
   // 'folder': keep every file (capped) for organizing a specific folder.
   // 'disk': aggregate sizes per directory and keep only files >= minStoreSize (whole drive / user home).
   mode: 'folder',
-  maxFiles: 60000,          // files kept in memory in folder mode
+  maxFiles: 60000,            // files kept in memory in folder mode
   maxStoredDiskFiles: 250000, // files kept in memory in disk mode
   minStoreSize: 1024 * 1024,  // disk mode: only store files >= 1 MB
   maxDepth: 40,
@@ -28,11 +28,11 @@ const SKIP_BY_PLATFORM = {
 };
 
 class TopN {
-  constructor(n) { this.n = n; this.items = []; this.min = -1; }
+  constructor(n, items = []) { this.n = n; this.items = []; this.min = -1; for (const it of items) this.push(it); }
   push(item) {
     if (this.items.length < this.n) {
       this.items.push(item);
-      if (this.items.length === this.n) this.items.sort((a, b) => a.size - b.size), this.min = this.items[0].size;
+      if (this.items.length === this.n) { this.items.sort((a, b) => a.size - b.size); this.min = this.items[0].size; }
       return;
     }
     if (item.size <= this.min) return;
@@ -43,36 +43,83 @@ class TopN {
   sorted() { return [...this.items].sort((a, b) => b.size - a.size); }
 }
 
-/**
- * Walk `root` recursively. Returns file inventory (possibly partial in disk mode) plus a complete
- * per-directory size tree, category totals and top-N lists computed over EVERY file seen.
- * Symlinks / junctions are never followed.
- */
-async function scanDirectory(root, options = {}) {
-  const opts = { ...DEFAULTS, ...options };
-  const rootAbs = path.resolve(root);
-  const stat = await fsp.stat(rootAbs);
-  if (!stat.isDirectory()) throw new Error('La ruta seleccionada no es una carpeta');
+function joinRel(dir, name) { return dir ? `${dir}/${name}` : name; }
+function parentOf(rel) { return rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : ''; }
+function absOf(scan, rel) { return rel ? path.join(scan.root, ...rel.split('/')) : scan.root; }
 
+function newDirRecord(rel, name, parent, depth, entriesCount) {
+  return {
+    rel, name, parent, depth,
+    directFiles: 0, directSize: 0,
+    fileCount: 0, size: 0,             // aggregated (subtree)
+    subdirCount: 0,
+    empty: entriesCount === 0,
+    junkDir: JUNK_DIR_NAMES.has(name),
+    cats: {},                          // category -> [count, bytes] for direct files
+    junkCount: 0, junkBytes: 0,        // direct junk files
+  };
+}
+
+/**
+ * Stat every direct file of one directory. Returns file records (all of them) and updates `dirRec`.
+ * Subdirectory names are returned separately so the caller decides whether to descend.
+ */
+async function readDirLevel(rootAbs, rel, abs, depth, parent, errors) {
+  let entries;
+  try {
+    entries = await fsp.readdir(abs, { withFileTypes: true });
+  } catch (err) {
+    errors.push({ path: rel || '.', error: err.code || err.message });
+    return null;
+  }
+  const dirRec = newDirRecord(rel, path.basename(abs) || abs, parent, depth, entries.length);
+  const files = [];
+  const subdirs = [];
+  for (const entry of entries) {
+    const entryAbs = path.join(abs, entry.name);
+    if (entry.isSymbolicLink()) continue;
+    if (entry.isDirectory()) { dirRec.subdirCount += 1; subdirs.push({ name: entry.name, abs: entryAbs }); continue; }
+    if (!entry.isFile()) continue;
+    let st;
+    try {
+      st = await fsp.stat(entryAbs);
+    } catch (err) {
+      if (errors.length < 500) errors.push({ path: joinRel(rel, entry.name), error: err.code || err.message });
+      continue;
+    }
+    const size = st.size;
+    const category = categoryOf(entry.name);
+    const isJunk = looksLikeJunk(entry.name) || dirRec.junkDir;
+    dirRec.directFiles += 1;
+    dirRec.directSize += size;
+    const c = dirRec.cats[category] || (dirRec.cats[category] = [0, 0]);
+    c[0] += 1; c[1] += size;
+    if (isJunk) { dirRec.junkCount += 1; dirRec.junkBytes += size; }
+    files.push({
+      rel: joinRel(rel, entry.name), name: entry.name, dir: rel, ext: extensionOf(entry.name), category,
+      size, mtimeMs: Math.round(st.mtimeMs), depth, junk: isJunk,
+    });
+  }
+  return { dirRec, files, subdirs };
+}
+
+/**
+ * Walk `startRel` (relative to rootAbs, '' = root) recursively. Returns the raw subtree: dir records
+ * (not yet aggregated), stored files, largest/junk candidates and per-walk counters.
+ */
+async function walk(rootAbs, startRel, opts, { parent = null, depth = 0 } = {}) {
   const diskMode = opts.mode === 'disk';
   const skipAbs = new Set([...(SKIP_BY_PLATFORM[process.platform] || []), ...opts.skipAbsolute].map((p) => path.resolve(p).toLowerCase()));
-
-  const files = [];
   const dirs = [];
-  const dirIndex = new Map(); // rel -> dir record
+  const files = [];
   const errors = [];
-  const byCategory = new Map();
-  const byExtension = new Map();
   const largest = new TopN(opts.topLargest);
   const junk = [];
-  let junkBytes = 0;
-  let junkCount = 0;
   let totalSize = 0;
   let totalFiles = 0;
   let truncated = false;
-  let lastProgress = 0;
   let cancelled = false;
-
+  let lastProgress = 0;
   const report = (extra = {}) => {
     if (!opts.onProgress) return;
     const now = Date.now();
@@ -81,150 +128,112 @@ async function scanDirectory(root, options = {}) {
       opts.onProgress({ files: totalFiles, dirs: dirs.length, bytes: totalSize, ...extra });
     }
   };
-
-  const bump = (map, key, size) => {
-    const e = map.get(key) || { key, count: 0, bytes: 0 };
-    e.count += 1;
-    e.bytes += size;
-    map.set(key, e);
-  };
-
-  const stack = [{ abs: rootAbs, depth: 0, parent: null }];
+  const stack = [{ rel: startRel, abs: startRel ? path.join(rootAbs, ...startRel.split('/')) : rootAbs, depth, parent }];
   while (stack.length > 0) {
     if (opts.shouldCancel && opts.shouldCancel()) { cancelled = true; break; }
-    const { abs, depth, parent } = stack.pop();
-    let entries;
-    try {
-      entries = await fsp.readdir(abs, { withFileTypes: true });
-    } catch (err) {
-      errors.push({ path: toRel(rootAbs, abs) || '.', error: err.code || err.message });
-      continue;
-    }
-
-    const rel = toRel(rootAbs, abs);
-    const dirRec = {
-      rel,
-      name: path.basename(abs) || abs,
-      parent,
-      depth,
-      directFiles: 0,
-      directSize: 0,
-      fileCount: 0,   // aggregated later
-      size: 0,        // aggregated later
-      subdirCount: 0,
-      empty: entries.length === 0,
-      junkDir: JUNK_DIR_NAMES.has(path.basename(abs)),
-    };
-    dirs.push(dirRec);
-    dirIndex.set(rel, dirRec);
-
-    for (const entry of entries) {
-      const entryAbs = path.join(abs, entry.name);
-      if (entry.isSymbolicLink()) continue;
-      if (entry.isDirectory()) {
-        dirRec.subdirCount += 1;
-        if (skipAbs.has(entryAbs.toLowerCase())) continue;
-        if (depth + 1 <= opts.maxDepth) stack.push({ abs: entryAbs, depth: depth + 1, parent: rel });
-        continue;
-      }
-      if (!entry.isFile()) continue;
-      let st;
-      try {
-        st = await fsp.stat(entryAbs);
-      } catch (err) {
-        if (errors.length < 500) errors.push({ path: toRel(rootAbs, entryAbs), error: err.code || err.message });
-        continue;
-      }
-      const size = st.size;
-      const ext = extensionOf(entry.name);
-      const category = categoryOf(entry.name);
+    const cur = stack.pop();
+    const level = await readDirLevel(rootAbs, cur.rel, cur.abs, cur.depth, cur.parent, errors);
+    if (!level) continue;
+    dirs.push(level.dirRec);
+    for (const f of level.files) {
       totalFiles += 1;
-      totalSize += size;
-      dirRec.directFiles += 1;
-      dirRec.directSize += size;
-      bump(byCategory, category, size);
-      bump(byExtension, ext || '(sin extensión)', size);
-
-      const fileRel = rel ? `${rel}/${entry.name}` : entry.name;
-      const isJunk = looksLikeJunk(entry.name) || dirRec.junkDir;
-      const record = {
-        rel: fileRel,
-        name: entry.name,
-        dir: rel,
-        ext,
-        category,
-        size,
-        mtimeMs: Math.round(st.mtimeMs),
-        depth,
-        junk: isJunk,
-      };
-      largest.push(record);
-      if (isJunk) {
-        junkCount += 1;
-        junkBytes += size;
-        if (junk.length < opts.maxJunk) junk.push(record);
-      }
-      const keep = diskMode ? size >= opts.minStoreSize : true;
+      totalSize += f.size;
+      largest.push(f);
+      if (f.junk && junk.length < opts.maxJunk) junk.push(f);
+      const keep = diskMode ? f.size >= opts.minStoreSize : true;
       const cap = diskMode ? opts.maxStoredDiskFiles : opts.maxFiles;
-      if (keep) {
-        if (files.length < cap) files.push(record);
-        else truncated = true;
-      }
+      if (keep) { if (files.length < cap) files.push(f); else truncated = true; }
     }
-    report({ current: rel || path.basename(rootAbs) });
+    for (const sd of level.subdirs) {
+      if (skipAbs.has(sd.abs.toLowerCase())) continue;
+      if (cur.depth + 1 <= opts.maxDepth) stack.push({ rel: joinRel(cur.rel, sd.name), abs: sd.abs, depth: cur.depth + 1, parent: cur.rel });
+    }
+    report({ current: cur.rel || path.basename(rootAbs) });
   }
+  report({ done: true });
+  return { dirs, files, errors, largest: largest.sorted(), junk, totalSize, totalFiles, truncated, cancelled };
+}
 
-  // Aggregate sizes bottom-up (deepest first).
+/** Sum direct sizes up the tree for a list of dir records (deepest first). */
+function aggregate(dirs, index) {
+  for (const d of dirs) { d.size = d.directSize; d.fileCount = d.directFiles; }
   const byDepth = [...dirs].sort((a, b) => b.depth - a.depth);
   for (const d of byDepth) {
-    d.size += d.directSize;
-    d.fileCount += d.directFiles;
-    if (d.parent != null) {
-      const p = dirIndex.get(d.parent);
-      if (p) { p.size += d.size; p.fileCount += d.fileCount; }
-    }
+    if (d.parent == null) continue;
+    const p = index.get(d.parent);
+    if (p) { p.size += d.size; p.fileCount += d.fileCount; }
   }
+}
 
-  report({ done: true });
+function buildIndex(scan) {
+  scan.index = new Map(scan.dirs.map((d) => [d.rel, d]));
+  return scan.index;
+}
 
-  return {
+function indexOf(scan) {
+  return scan.index && scan.index.size === scan.dirs.length ? scan.index : buildIndex(scan);
+}
+
+/** Full scan of `root`. */
+async function scanDirectory(root, options = {}) {
+  const opts = { ...DEFAULTS, ...options };
+  const rootAbs = path.resolve(root);
+  const stat = await fsp.stat(rootAbs);
+  if (!stat.isDirectory()) throw new Error('La ruta seleccionada no es una carpeta');
+  const diskMode = opts.mode === 'disk';
+  const w = await walk(rootAbs, '', opts);
+  const scan = {
     root: rootAbs,
     mode: diskMode ? 'disk' : 'folder',
+    options: { minStoreSize: opts.minStoreSize, maxFiles: opts.maxFiles, maxStoredDiskFiles: opts.maxStoredDiskFiles, maxDepth: opts.maxDepth, topLargest: opts.topLargest, maxJunk: opts.maxJunk },
     scannedAt: new Date().toISOString(),
-    files,
-    dirs,
-    errors,
-    totalSize,
-    totalFiles,
-    truncated,
-    cancelled,
-    stats: {
-      categories: [...byCategory.values()].map((c) => ({ category: c.key, count: c.count, bytes: c.bytes })).sort((a, b) => b.bytes - a.bytes),
-      extensions: [...byExtension.values()].map((e) => ({ ext: e.key, count: e.count, bytes: e.bytes })).sort((a, b) => b.bytes - a.bytes).slice(0, 40),
-      largest: largest.sorted(),
-      junk: junk.sort((a, b) => b.size - a.size),
-      junkBytes,
-      junkCount,
-    },
+    updatedAt: new Date().toISOString(),
+    files: w.files,
+    dirs: w.dirs,
+    errors: w.errors,
+    totalSize: w.totalSize,
+    totalFiles: w.totalFiles,
+    truncated: w.truncated,
+    cancelled: w.cancelled,
+    stats: { largest: w.largest, junk: w.junk.sort((a, b) => b.size - a.size) },
   };
+  aggregate(scan.dirs, buildIndex(scan));
+  return scan;
+}
+
+/** Category totals over every directory's direct-file breakdown (exact, even in disk mode). */
+function categoryTotals(scan) {
+  const map = new Map();
+  for (const d of scan.dirs) {
+    for (const [cat, [count, bytes]] of Object.entries(d.cats || {})) {
+      const e = map.get(cat) || { category: cat, count: 0, bytes: 0 };
+      e.count += count; e.bytes += bytes;
+      map.set(cat, e);
+    }
+  }
+  return [...map.values()].sort((a, b) => b.bytes - a.bytes);
+}
+
+function junkTotals(scan) {
+  let count = 0; let bytes = 0;
+  for (const d of scan.dirs) { count += d.junkCount || 0; bytes += d.junkBytes || 0; }
+  return { count, bytes };
 }
 
 function summarize(scan, options = {}) {
   const now = options.now || Date.now();
   const topN = options.topN || 25;
   const dayMs = 86400000;
-  const rootDir = scan.dirs.find((d) => d.rel === '');
+  const rootDir = indexOf(scan).get('');
   const rootFiles = rootDir ? rootDir.directFiles : 0;
 
-  const oldLarge = scan.stats.largest
-    .filter((f) => f.size >= 50 * 1024 * 1024 && now - f.mtimeMs > 180 * dayMs)
-    .sort((a, b) => b.size - a.size)
-    .slice(0, topN);
-  const emptyDirs = scan.dirs.filter((d) => d.empty && d.rel !== '');
-
-  // Age buckets over stored files (complete in folder mode, files >= 1 MB in disk mode).
+  const byExtension = new Map();
   const ageBuckets = { '< 30 días': 0, '30-180 días': 0, '180-365 días': 0, '> 1 año': 0 };
   for (const f of scan.files) {
+    const key = f.ext || '(sin extensión)';
+    const e = byExtension.get(key) || { ext: key, count: 0, bytes: 0 };
+    e.count += 1; e.bytes += f.size;
+    byExtension.set(key, e);
     const age = (now - f.mtimeMs) / dayMs;
     if (age < 30) ageBuckets['< 30 días'] += f.size;
     else if (age < 180) ageBuckets['30-180 días'] += f.size;
@@ -232,6 +241,12 @@ function summarize(scan, options = {}) {
     else ageBuckets['> 1 año'] += f.size;
   }
 
+  const oldLarge = scan.stats.largest
+    .filter((f) => f.size >= 50 * 1024 * 1024 && now - f.mtimeMs > 180 * dayMs)
+    .sort((a, b) => b.size - a.size)
+    .slice(0, topN);
+  const junk = junkTotals(scan);
+  const emptyDirs = scan.dirs.filter((d) => d.empty && d.rel !== '');
   const topDirs = scan.dirs
     .filter((d) => d.depth === 1)
     .sort((a, b) => b.size - a.size)
@@ -241,6 +256,8 @@ function summarize(scan, options = {}) {
   return {
     root: scan.root,
     mode: scan.mode,
+    scannedAt: scan.scannedAt,
+    updatedAt: scan.updatedAt,
     totalFiles: scan.totalFiles,
     totalDirs: scan.dirs.length,
     totalSize: scan.totalSize,
@@ -249,13 +266,14 @@ function summarize(scan, options = {}) {
     truncated: scan.truncated,
     cancelled: scan.cancelled,
     errorCount: scan.errors.length,
-    categories: scan.stats.categories,
-    extensions: scan.stats.extensions.slice(0, 30),
+    categories: categoryTotals(scan),
+    extensions: [...byExtension.values()].sort((a, b) => b.bytes - a.bytes).slice(0, 30),
+    extensionsPartial: scan.mode === 'disk',
     largest: scan.stats.largest.slice(0, topN),
     oldLarge,
     junk: scan.stats.junk,
-    junkBytes: scan.stats.junkBytes,
-    junkCount: scan.stats.junkCount,
+    junkBytes: junk.bytes,
+    junkCount: junk.count,
     emptyDirs,
     ageBuckets,
     topDirs,
@@ -265,7 +283,8 @@ function summarize(scan, options = {}) {
 /** Children (dirs + stored files) of one directory, for the disk explorer view. */
 function listChildren(scan, rel = '') {
   const clean = String(rel || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
-  const node = scan.dirs.find((d) => d.rel === clean);
+  const index = indexOf(scan);
+  const node = index.get(clean);
   if (!node) return null;
   const dirs = scan.dirs
     .filter((d) => d.parent === clean)
@@ -278,23 +297,192 @@ function listChildren(scan, rel = '') {
   const crumbs = [];
   let cur = clean;
   while (cur) {
-    const n = scan.dirs.find((d) => d.rel === cur);
+    const n = index.get(cur);
     crumbs.unshift({ rel: cur, name: n ? n.name : cur.split('/').pop() });
-    cur = n ? n.parent : '';
+    cur = n ? (n.parent || '') : '';
   }
   return {
-    rel: clean,
-    name: node.name,
-    size: node.size,
-    fileCount: node.fileCount,
-    directFiles: node.directFiles,
-    directSize: node.directSize,
-    crumbs,
-    dirs,
-    files,
-    filesPartial: scan.mode === 'disk',
+    rel: clean, name: node.name, size: node.size, fileCount: node.fileCount,
+    directFiles: node.directFiles, directSize: node.directSize,
+    crumbs, dirs, files, filesPartial: scan.mode === 'disk',
   };
 }
+
+// ---------------------------------------------------------------------------
+// Incremental updates
+// ---------------------------------------------------------------------------
+
+/** Add (or subtract, with sign -1) a subtree's totals to every ancestor of `rel`. */
+function propagate(scan, fromRel, size, fileCount) {
+  const index = indexOf(scan);
+  let cur = fromRel;
+  for (;;) {
+    const node = index.get(cur);
+    if (node) { node.size += size; node.fileCount += fileCount; }
+    if (cur === '') break;
+    cur = parentOf(cur);
+  }
+}
+
+/** Drop a directory subtree or a single file from an in-memory scan (after move/trash). */
+function removeSubtree(scan, rel) {
+  const clean = String(rel || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+  if (!clean) return scan;
+  const prefix = `${clean}/`;
+  const index = indexOf(scan);
+  const dirNode = index.get(clean);
+  const inSubtree = (r) => r === clean || r.startsWith(prefix);
+  let removedSize = 0;
+  let removedFiles = 0;
+  if (dirNode) {
+    removedSize = dirNode.size;
+    removedFiles = dirNode.fileCount;
+    scan.dirs = scan.dirs.filter((d) => !inSubtree(d.rel));
+    scan.files = scan.files.filter((f) => !inSubtree(f.rel));
+    scan.stats.largest = scan.stats.largest.filter((f) => !inSubtree(f.rel));
+    scan.stats.junk = scan.stats.junk.filter((f) => !inSubtree(f.rel));
+    buildIndex(scan);
+    const parent = scan.index.get(parentOf(clean));
+    if (parent) { parent.subdirCount = Math.max(0, parent.subdirCount - 1); parent.empty = parent.subdirCount === 0 && parent.directFiles === 0; }
+    propagate(scan, parentOf(clean), -removedSize, -removedFiles);
+  } else {
+    const file = [...scan.files, ...scan.stats.largest, ...scan.stats.junk].find((f) => f.rel === clean);
+    if (!file) return scan;
+    removedSize = file.size;
+    removedFiles = 1;
+    scan.files = scan.files.filter((f) => f.rel !== clean);
+    scan.stats.largest = scan.stats.largest.filter((f) => f.rel !== clean);
+    scan.stats.junk = scan.stats.junk.filter((f) => f.rel !== clean);
+    const parent = index.get(parentOf(clean));
+    if (parent) {
+      parent.directFiles -= 1;
+      parent.directSize -= removedSize;
+      const c = parent.cats[file.category];
+      if (c) { c[0] -= 1; c[1] -= removedSize; if (c[0] <= 0) delete parent.cats[file.category]; }
+      if (file.junk) { parent.junkCount -= 1; parent.junkBytes -= removedSize; }
+      parent.empty = parent.subdirCount === 0 && parent.directFiles === 0;
+    }
+    propagate(scan, parentOf(clean), -removedSize, -removedFiles);
+  }
+  scan.totalSize -= removedSize;
+  scan.totalFiles -= removedFiles;
+  scan.updatedAt = new Date().toISOString();
+  return scan;
+}
+
+/** Splice a freshly walked subtree (already prefixed with real rels) into the scan. */
+function insertSubtree(scan, w, startRel) {
+  const walkedIndex = new Map(w.dirs.map((d) => [d.rel, d]));
+  aggregate(w.dirs, walkedIndex);
+  const top = walkedIndex.get(startRel);
+  scan.dirs.push(...w.dirs);
+  scan.files.push(...w.files);
+  scan.stats.largest = new TopN(scan.options?.topLargest || DEFAULTS.topLargest, [...scan.stats.largest, ...w.largest]).sorted();
+  scan.stats.junk = [...scan.stats.junk, ...w.junk].sort((a, b) => b.size - a.size).slice(0, scan.options?.maxJunk || DEFAULTS.maxJunk);
+  scan.errors = [...scan.errors.filter((e) => !(e.path === startRel || e.path.startsWith(`${startRel}/`))), ...w.errors].slice(0, 2000);
+  buildIndex(scan);
+  if (top && startRel !== '') {
+    const parent = scan.index.get(parentOf(startRel));
+    if (parent) { parent.subdirCount += 1; parent.empty = false; }
+    propagate(scan, parentOf(startRel), top.size, top.fileCount);
+  }
+  scan.totalSize += w.totalSize;
+  scan.totalFiles += w.totalFiles;
+  if (w.truncated) scan.truncated = true;
+  scan.updatedAt = new Date().toISOString();
+}
+
+/**
+ * Re-scan one directory subtree from disk and replace it inside the existing scan.
+ * Everything outside the subtree is left untouched.
+ */
+async function rescanSubtree(scan, rel, options = {}) {
+  const clean = String(rel || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+  const opts = { ...DEFAULTS, ...(scan.options || {}), mode: scan.mode, ...options };
+  const index = indexOf(scan);
+  const existing = index.get(clean);
+  const depth = existing ? existing.depth : (clean ? clean.split('/').length : 0);
+  const parent = clean ? parentOf(clean) : null;
+  if (clean) removeSubtree(scan, clean);
+  else { scan.dirs = []; scan.files = []; scan.stats = { largest: [], junk: [] }; scan.errors = []; scan.totalSize = 0; scan.totalFiles = 0; buildIndex(scan); }
+  let exists = true;
+  try { await fsp.stat(absOf(scan, clean)); } catch { exists = false; }
+  if (!exists) return { removed: true };
+  const w = await walk(scan.root, clean, opts, { parent, depth });
+  insertSubtree(scan, w, clean);
+  return { removed: false, files: w.totalFiles, bytes: w.totalSize, cancelled: w.cancelled };
+}
+
+/**
+ * Cheap refresh of ONE directory level: re-stat its direct files, pick up new subfolders (walked fully,
+ * they are new) and drop vanished ones. Used after moving/trashing files so no full rescan is needed.
+ */
+async function refreshDirShallow(scan, rel, options = {}) {
+  const clean = String(rel || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+  const opts = { ...DEFAULTS, ...(scan.options || {}), mode: scan.mode, ...options };
+  const diskMode = scan.mode === 'disk';
+  const index = indexOf(scan);
+  const node = index.get(clean);
+  if (!node) return rescanSubtree(scan, clean, options);
+  const errors = [];
+  const level = await readDirLevel(scan.root, clean, absOf(scan, clean), node.depth, node.parent, errors);
+  if (!level) { removeSubtree(scan, clean); return { removed: true }; }
+  const prefix = clean ? `${clean}/` : '';
+  const isDirect = (f) => f.dir === clean;
+  // Remove old direct files everywhere, keep the dir record but reset its direct counters.
+  const oldSize = node.directSize;
+  const oldFiles = node.directFiles;
+  scan.files = scan.files.filter((f) => !isDirect(f));
+  scan.stats.largest = scan.stats.largest.filter((f) => !isDirect(f));
+  scan.stats.junk = scan.stats.junk.filter((f) => !isDirect(f));
+  const fresh = level.dirRec;
+  Object.assign(node, { directFiles: fresh.directFiles, directSize: fresh.directSize, cats: fresh.cats, junkCount: fresh.junkCount, junkBytes: fresh.junkBytes });
+  for (const f of level.files) {
+    const keep = diskMode ? f.size >= opts.minStoreSize : true;
+    if (keep) scan.files.push(f);
+  }
+  scan.stats.largest = new TopN(opts.topLargest, [...scan.stats.largest, ...level.files]).sorted();
+  scan.stats.junk = [...scan.stats.junk, ...level.files.filter((f) => f.junk)].sort((a, b) => b.size - a.size).slice(0, opts.maxJunk);
+  const deltaSize = fresh.directSize - oldSize;
+  const deltaFiles = fresh.directFiles - oldFiles;
+  propagate(scan, clean, deltaSize, deltaFiles);
+  scan.totalSize += deltaSize;
+  scan.totalFiles += deltaFiles;
+  // Subdirectories: new ones get walked, vanished ones removed.
+  const currentNames = new Set(level.subdirs.map((s) => s.name));
+  const knownChildren = scan.dirs.filter((d) => d.parent === clean);
+  for (const child of knownChildren) if (!currentNames.has(child.name)) removeSubtree(scan, child.rel);
+  const known = new Set(knownChildren.map((d) => d.name));
+  for (const sd of level.subdirs) {
+    if (known.has(sd.name)) continue;
+    const childRel = prefix + sd.name;
+    const w = await walk(scan.root, childRel, opts, { parent: clean, depth: node.depth + 1 });
+    insertSubtree(scan, w, childRel);
+  }
+  node.subdirCount = level.subdirs.length;
+  node.empty = level.subdirs.length === 0 && fresh.directFiles === 0;
+  scan.updatedAt = new Date().toISOString();
+  return { removed: false };
+}
+
+/** Refresh the minimal set of directories that contain the given files/dirs (after a batch of moves). */
+async function refreshAffected(scan, rels, options = {}) {
+  const dirs = new Set();
+  const index = indexOf(scan);
+  for (const r of rels) {
+    const clean = String(r || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+    dirs.add(index.get(clean) ? clean : parentOf(clean));
+  }
+  // Drop dirs whose ancestor is also in the set only if that ancestor will be fully rescanned (it is not: shallow),
+  // so keep all of them but process shallowest first (parents may create new children we then know about).
+  const list = [...dirs].sort((a, b) => a.split('/').length - b.split('/').length || a.localeCompare(b));
+  for (const d of list) await refreshDirShallow(scan, d, options);
+  return { refreshed: list };
+}
+
+// ---------------------------------------------------------------------------
+// Duplicates
+// ---------------------------------------------------------------------------
 
 async function hashFile(abs, { partial = false } = {}) {
   const hash = crypto.createHash('sha1');
@@ -317,9 +505,6 @@ async function hashFile(abs, { partial = false } = {}) {
   });
 }
 
-/**
- * Find duplicate files among the stored inventory: group by size, then partial hash, then full hash.
- */
 async function findDuplicates(scan, options = {}) {
   const minSize = options.minSize ?? 1;
   const onProgress = options.onProgress || (() => {});
@@ -334,7 +519,6 @@ async function findDuplicates(scan, options = {}) {
   const total = candidates.reduce((s, l) => s + l.length, 0);
   let processed = 0;
   const groups = [];
-
   for (const list of candidates) {
     if (options.shouldCancel && options.shouldCancel()) break;
     const byPartial = new Map();
@@ -380,52 +564,11 @@ function formatBytes(bytes) {
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
   let i = 0;
   let v = bytes;
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024;
-    i += 1;
-  }
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i += 1; }
   return `${v < 10 && i > 0 ? v.toFixed(1) : Math.round(v)} ${units[i]}`;
 }
 
-module.exports = { scanDirectory, summarize, listChildren, findDuplicates, formatBytes, hashFile };
-
-/** Drop a directory subtree or a single file from an in-memory scan after it was moved/trashed. */
-function removeSubtree(scan, rel) {
-  const clean = String(rel || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
-  if (!clean) return scan;
-  const prefix = `${clean}/`;
-  const dirNode = scan.dirs.find((d) => d.rel === clean);
-  let removedSize = 0;
-  let removedFiles = 0;
-  if (dirNode) {
-    removedSize = dirNode.size;
-    removedFiles = dirNode.fileCount;
-    scan.dirs = scan.dirs.filter((d) => d.rel !== clean && !d.rel.startsWith(prefix));
-    scan.files = scan.files.filter((f) => !f.rel.startsWith(prefix));
-    scan.stats.largest = scan.stats.largest.filter((f) => !f.rel.startsWith(prefix));
-    scan.stats.junk = scan.stats.junk.filter((f) => !f.rel.startsWith(prefix));
-  } else {
-    const file = [...scan.files, ...scan.stats.largest, ...scan.stats.junk].find((f) => f.rel === clean);
-    if (!file) return scan;
-    removedSize = file.size;
-    removedFiles = 1;
-    scan.files = scan.files.filter((f) => f.rel !== clean);
-    scan.stats.largest = scan.stats.largest.filter((f) => f.rel !== clean);
-    scan.stats.junk = scan.stats.junk.filter((f) => f.rel !== clean);
-    const parent = scan.dirs.find((d) => d.rel === (clean.includes('/') ? clean.slice(0, clean.lastIndexOf('/')) : ''));
-    if (parent) { parent.directFiles -= 1; parent.directSize -= removedSize; }
-  }
-  // Walk up the ancestors subtracting.
-  let cur = clean.includes('/') ? clean.slice(0, clean.lastIndexOf('/')) : '';
-  for (;;) {
-    const node = scan.dirs.find((d) => d.rel === cur);
-    if (node) { node.size -= removedSize; node.fileCount -= removedFiles; if (dirNode && node.rel === (dirNode.parent || '')) node.subdirCount -= 1; }
-    if (cur === '') break;
-    cur = cur.includes('/') ? cur.slice(0, cur.lastIndexOf('/')) : '';
-  }
-  scan.totalSize -= removedSize;
-  scan.totalFiles -= removedFiles;
-  return scan;
-}
-
-module.exports.removeSubtree = removeSubtree;
+module.exports = {
+  scanDirectory, summarize, listChildren, findDuplicates, formatBytes, hashFile,
+  removeSubtree, rescanSubtree, refreshDirShallow, refreshAffected, buildIndex, categoryTotals,
+};
