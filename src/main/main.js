@@ -4,6 +4,7 @@ const { app, BrowserWindow, ipcMain, dialog, shell, safeStorage, Menu, nativeThe
 const path = require('path');
 const { scanDirectory, summarize, findDuplicates, listChildren, removeSubtree, removeMany, rescanSubtree, refreshAffected } = require('./scanner');
 const { ScanCache } = require('./cache');
+const { filterFiles } = require('./query');
 const planner = require('./planner');
 const minimax = require('./minimax');
 const { Journal, applyMoves, undoMoves, trashFiles, removeEmptyDirs, relocate, undoRelocate } = require('./operations');
@@ -62,6 +63,7 @@ function createWindow() {
   // Developer hooks: ORDENA_DEV_SCAN=<carpeta> analiza al arrancar; ORDENA_SCREENSHOT=<png> captura y cierra.
   mainWindow.webContents.once('did-finish-load', async () => {
     if (process.env.ORDENA_DEV_SCAN) send('dev:scan', { root: process.env.ORDENA_DEV_SCAN, mode: process.env.ORDENA_DEV_SCAN_MODE || undefined, fromCache: process.env.ORDENA_DEV_SCAN_CACHE === '1' });
+    if (process.env.ORDENA_DEV_QUERY) setTimeout(() => send('dev:query', JSON.parse(process.env.ORDENA_DEV_QUERY)), Number(process.env.ORDENA_DEV_ACTION_DELAY || 2500));
     if (process.env.ORDENA_DEV_ACTION) setTimeout(() => send('dev:action', process.env.ORDENA_DEV_ACTION), Number(process.env.ORDENA_DEV_ACTION_DELAY || 2500));
     if (process.env.ORDENA_SCREENSHOT) {
       const delay = Number(process.env.ORDENA_SCREENSHOT_DELAY || 2500);
@@ -275,6 +277,24 @@ handle('scan:children', async (rel) => {
     abs: level.rel ? path.join(scan.root, ...level.rel.split('/')) : scan.root,
     dirs: level.dirs.map((d) => enrichEntry(scan, d, true)),
     files: level.files.map((f) => enrichEntry(scan, f, false)),
+  };
+});
+
+/**
+ * Filtered listing of the stored files (all files in folder mode; files >= 1 MB in disk mode).
+ * q: { category, ext, age, junk, oldLarge, search, dir, sort: 'size'|'date'|'name', offset, limit }
+ */
+handle('scan:query', async (q = {}) => {
+  const scan = requireScan();
+  const { list, totalBytes, topDirs } = filterFiles(scan.files, q);
+  const offset = Math.max(0, Number(q.offset) || 0);
+  const limit = Math.min(500, Math.max(1, Number(q.limit) || 200));
+  return {
+    total: list.length,
+    totalBytes,
+    partial: scan.mode === 'disk',
+    topDirs,
+    items: list.slice(offset, offset + limit).map((f) => enrichEntry(scan, f, false)),
   };
 });
 

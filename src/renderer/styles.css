@@ -233,6 +233,8 @@ details ul { margin: 6px 0 0; padding-left: 18px; font-family: var(--mono); font
 .crumb:hover { background: var(--accent-soft); }
 .crumb.current { color: var(--text); cursor: default; font-weight: 600; }
 .table-disk td:first-child { width: 46%; max-width: 560px; }
+#filesTable td:first-child { width: 28px; }
+#filesTable td:nth-child(2) { width: 42%; max-width: 560px; }
 .dir-link { background: none; border: 0; padding: 0; font: inherit; color: var(--text); cursor: pointer; text-align: left; font-weight: 550; }
 .dir-link:hover { color: var(--accent); text-decoration: underline; }
 .size-cell { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; min-width: 120px; }
@@ -273,3 +275,14 @@ details ul { margin: 6px 0 0; padding-left: 18px; font-family: var(--mono); font
 .open-option .small { color: var(--text-3); }
 
 .opsbar { display: flex; align-items: center; gap: 14px; padding: 8px 22px; background: var(--accent-soft); border-bottom: 1px solid var(--border); }
+
+.bar-row[data-q], .bar-row[data-dir] { cursor: pointer; border-radius: 6px; padding: 2px 4px; margin: 0 -4px; }
+.bar-row[data-q]:hover, .bar-row[data-dir]:hover { background: var(--surface-2); }
+.bar-row[data-q]:hover .bar-label, .bar-row[data-dir]:hover .bar-label { color: var(--accent); }
+.tile[data-q] { cursor: pointer; }
+.tile[data-q]:hover { border-color: var(--accent); }
+.chip[data-q] { cursor: pointer; }
+.chip[data-q]:hover { color: var(--accent); }
+.chip-filter { background: var(--accent-soft); color: var(--accent); font-weight: 600; display: inline-flex; gap: 6px; align-items: center; }
+.chip-filter button { background: none; border: 0; color: inherit; cursor: pointer; font-size: 13px; padding: 0; line-height: 1; }
+select.btn { padding-right: 28px; }

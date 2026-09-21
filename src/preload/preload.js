@@ -31,6 +31,7 @@ contextBridge.exposeInMainWorld('ordena', {
   refresh: (rel) => invoke('scan:refresh', rel),
   cancelScan: () => invoke('scan:cancel'),
   children: (rel) => invoke('scan:children', rel),
+  query: (q) => invoke('scan:query', q),
   pickDestination: () => invoke('dialog:pickDestination'),
   findDuplicates: () => invoke('scan:duplicates'),
   searchFiles: (q) => invoke('scan:files', q),
@@ -70,4 +71,5 @@ contextBridge.exposeInMainWorld('ordena', {
   onDevScan: (cb) => on('dev:scan', cb),
   onDevView: (cb) => on('dev:view', cb),
   onDevAction: (cb) => on('dev:action', cb),
+  onDevQuery: (cb) => on('dev:query', cb),
 });

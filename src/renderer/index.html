@@ -17,6 +17,7 @@
         <button class="nav-item active" data-view="home"><span class="nav-icon">📁</span>Carpeta</button>
         <button class="nav-item" data-view="analysis" data-needs-scan><span class="nav-icon">📊</span>Análisis</button>
         <button class="nav-item" data-view="disk" data-needs-scan><span class="nav-icon">💽</span>Explorar</button>
+        <button class="nav-item" data-view="files" data-needs-scan><span class="nav-icon">🗃️</span>Archivos</button>
         <button class="nav-item" data-view="organize" data-needs-scan><span class="nav-icon">🗂️</span>Organizar</button>
         <button class="nav-item" data-view="cleanup" data-needs-scan><span class="nav-icon">🧹</span>Liberar espacio</button>
         <button class="nav-item" data-view="chat" data-needs-scan><span class="nav-icon">💬</span>Preguntar</button>
@@ -113,7 +114,7 @@
           <div class="bars" id="topDirsBars"></div>
         </div>
         <div class="card">
-          <h3>Archivos más grandes</h3>
+          <div class="row between"><h3>Archivos más grandes</h3><button class="btn btn-sm" data-q='{"sort":"size"}'>Ver todos</button></div>
           <table class="table" id="largestTable"><thead><tr><th>Archivo</th><th>Categoría</th><th>Modificado</th><th class="num">Tamaño</th><th></th></tr></thead><tbody></tbody></table>
         </div>
         <div class="card" id="dupesCard" hidden>
@@ -123,6 +124,38 @@
         <div class="card" id="errorsCard" hidden>
           <h3>Avisos del análisis</h3>
           <ul class="small" id="errorsList"></ul>
+        </div>
+      </section>
+
+      <!-- FILES (filtered list) -->
+      <section class="view" id="view-files">
+        <div class="view-header">
+          <div><h2 id="filesTitle">Archivos</h2><div class="small muted" id="filesSubtitle"></div></div>
+          <div class="row gap">
+            <input type="text" id="filesSearch" placeholder="Buscar por nombre o ruta…" style="width:260px" />
+            <select id="filesSort" class="btn"><option value="size">Más grandes primero</option><option value="date">Más antiguos primero</option><option value="name">Por nombre</option></select>
+          </div>
+        </div>
+        <div class="chips" id="filesFilters"></div>
+        <div class="tiles" id="filesTiles"></div>
+        <div class="card" id="filesWhereCard" hidden>
+          <h3>Dónde están <span class="small muted">· pulsa una carpeta para acotar</span></h3>
+          <div class="bars" id="filesWhere"></div>
+        </div>
+        <div class="card">
+          <div class="row between wrap">
+            <h3>Lista <span class="small muted" id="filesNote"></span></h3>
+            <div class="row gap">
+              <button class="btn btn-ghost btn-sm" id="filesSelectAll">Marcar visibles</button>
+              <button class="btn btn-ghost btn-sm" id="filesSelectNone">Ninguno</button>
+            </div>
+          </div>
+          <table class="table table-disk" id="filesTable"><thead><tr><th></th><th>Archivo</th><th>Tipo</th><th class="num">Tamaño</th><th>Modificado</th><th></th></tr></thead><tbody></tbody></table>
+          <div class="row end mt-s" id="filesMoreRow" hidden><button class="btn btn-ghost btn-sm" id="btnFilesMore">Mostrar más</button></div>
+          <div class="actionbar">
+            <span id="filesSelectedText" class="muted"></span>
+            <button class="btn btn-danger" id="btnFilesTrash">Enviar a la Papelera</button>
+          </div>
         </div>
       </section>
 
