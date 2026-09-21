@@ -154,3 +154,30 @@ test('incremental refresh keeps totals exact after deleting, adding and moving f
   assert.equal(scan.dirs.find((d) => d.rel === '').directFiles, 2);
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+test('removeMany drops thousands of entries in one pass with exact totals', async () => {
+  const { removeMany } = require('../src/main/scanner');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ordena-many-'));
+  for (let i = 0; i < 40; i += 1) {
+    fs.mkdirSync(path.join(dir, `vacia${i}`));
+    fs.writeFileSync(path.join(dir, `log${i}.log`), Buffer.alloc(10 + i, 1));
+  }
+  fs.mkdirSync(path.join(dir, 'keep'));
+  fs.writeFileSync(path.join(dir, 'keep', 'doc.pdf'), Buffer.alloc(500, 2));
+  const scan = await scanDirectory(dir);
+  const before = summarize(scan);
+  assert.equal(before.emptyDirs.length, 40);
+  const rels = [...Array.from({ length: 40 }, (_, i) => `vacia${i}`), ...Array.from({ length: 40 }, (_, i) => `log${i}.log`), 'no-existe.txt'];
+  const t0 = Date.now();
+  removeMany(scan, rels);
+  assert.ok(Date.now() - t0 < 500);
+  const after = summarize(scan);
+  assert.equal(after.totalFiles, 1);
+  assert.equal(after.totalSize, 500);
+  assert.equal(after.emptyDirs.length, 0);
+  assert.equal(after.totalDirs, 2);
+  assert.equal(after.junkCount, 0);
+  assert.deepEqual(after.categories.map((c) => c.category), ['PDF']);
+  assert.equal(scan.dirs.find((d) => d.rel === '').subdirCount, 1);
+  fs.rmSync(dir, { recursive: true, force: true });
+});

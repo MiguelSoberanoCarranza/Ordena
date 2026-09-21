@@ -324,50 +324,83 @@ function propagate(scan, fromRel, size, fileCount) {
   }
 }
 
-/** Drop a directory subtree or a single file from an in-memory scan (after move/trash). */
-function removeSubtree(scan, rel) {
-  const clean = String(rel || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
-  if (!clean) return scan;
-  const prefix = `${clean}/`;
+function cleanRel(rel) { return String(rel || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, ''); }
+
+/**
+ * Drop many directory subtrees and/or single files from an in-memory scan in ONE pass
+ * (after a batch of trash/move operations). O(files + dirs) regardless of how many rels.
+ */
+function removeMany(scan, rels) {
   const index = indexOf(scan);
-  const dirNode = index.get(clean);
-  const inSubtree = (r) => r === clean || r.startsWith(prefix);
-  let removedSize = 0;
-  let removedFiles = 0;
-  if (dirNode) {
-    removedSize = dirNode.size;
-    removedFiles = dirNode.fileCount;
-    scan.dirs = scan.dirs.filter((d) => !inSubtree(d.rel));
-    scan.files = scan.files.filter((f) => !inSubtree(f.rel));
-    scan.stats.largest = scan.stats.largest.filter((f) => !inSubtree(f.rel));
-    scan.stats.junk = scan.stats.junk.filter((f) => !inSubtree(f.rel));
-    buildIndex(scan);
-    const parent = scan.index.get(parentOf(clean));
+  const dirRoots = [];
+  const fileRels = new Set();
+  for (const r of rels) {
+    const clean = cleanRel(r);
+    if (!clean) continue;
+    if (index.get(clean)) dirRoots.push(clean);
+    else fileRels.add(clean);
+  }
+  if (dirRoots.length === 0 && fileRels.size === 0) return scan;
+  // Keep only top-most dir roots (a nested one is covered by its ancestor).
+  dirRoots.sort();
+  const tops = [];
+  for (const d of dirRoots) if (!tops.some((t) => d === t || d.startsWith(`${t}/`))) tops.push(d);
+  const topSet = new Set(tops);
+  const inRemovedDir = (rel) => {
+    // walk up the ancestors of rel; O(depth)
+    let cur = rel;
+    for (;;) {
+      if (topSet.has(cur)) return true;
+      if (!cur.includes('/')) return false;
+      cur = parentOf(cur);
+    }
+  };
+  // Files: find records for single-file removals (to fix parent counters), then filter everything once.
+  const removedFileRecords = new Map();
+  const collect = (f) => { if (fileRels.has(f.rel) && !removedFileRecords.has(f.rel)) removedFileRecords.set(f.rel, f); };
+  for (const f of scan.files) collect(f);
+  for (const f of scan.stats.largest) collect(f);
+  for (const f of scan.stats.junk) collect(f);
+  const gone = (f) => fileRels.has(f.rel) || inRemovedDir(f.rel);
+  scan.files = scan.files.filter((f) => !gone(f));
+  scan.stats.largest = scan.stats.largest.filter((f) => !gone(f));
+  scan.stats.junk = scan.stats.junk.filter((f) => !gone(f));
+  // Dirs: subtract each top subtree from its ancestors, then drop the subtree records.
+  for (const top of tops) {
+    const node = index.get(top);
+    const parent = index.get(parentOf(top));
     if (parent) { parent.subdirCount = Math.max(0, parent.subdirCount - 1); parent.empty = parent.subdirCount === 0 && parent.directFiles === 0; }
-    propagate(scan, parentOf(clean), -removedSize, -removedFiles);
-  } else {
-    const file = [...scan.files, ...scan.stats.largest, ...scan.stats.junk].find((f) => f.rel === clean);
-    if (!file) return scan;
-    removedSize = file.size;
-    removedFiles = 1;
-    scan.files = scan.files.filter((f) => f.rel !== clean);
-    scan.stats.largest = scan.stats.largest.filter((f) => f.rel !== clean);
-    scan.stats.junk = scan.stats.junk.filter((f) => f.rel !== clean);
-    const parent = index.get(parentOf(clean));
+    propagate(scan, parentOf(top), -node.size, -node.fileCount);
+    scan.totalSize -= node.size;
+    scan.totalFiles -= node.fileCount;
+  }
+  if (tops.length) {
+    scan.dirs = scan.dirs.filter((d) => !inRemovedDir(d.rel));
+    buildIndex(scan);
+  }
+  // Single files: fix their parent's direct counters and propagate.
+  for (const file of removedFileRecords.values()) {
+    if (inRemovedDir(file.rel)) continue; // already accounted for by its removed folder
+    const parent = scan.index.get(parentOf(file.rel));
     if (parent) {
       parent.directFiles -= 1;
-      parent.directSize -= removedSize;
+      parent.directSize -= file.size;
       const c = parent.cats[file.category];
-      if (c) { c[0] -= 1; c[1] -= removedSize; if (c[0] <= 0) delete parent.cats[file.category]; }
-      if (file.junk) { parent.junkCount -= 1; parent.junkBytes -= removedSize; }
+      if (c) { c[0] -= 1; c[1] -= file.size; if (c[0] <= 0) delete parent.cats[file.category]; }
+      if (file.junk) { parent.junkCount -= 1; parent.junkBytes -= file.size; }
       parent.empty = parent.subdirCount === 0 && parent.directFiles === 0;
     }
-    propagate(scan, parentOf(clean), -removedSize, -removedFiles);
+    propagate(scan, parentOf(file.rel), -file.size, -1);
+    scan.totalSize -= file.size;
+    scan.totalFiles -= 1;
   }
-  scan.totalSize -= removedSize;
-  scan.totalFiles -= removedFiles;
   scan.updatedAt = new Date().toISOString();
   return scan;
+}
+
+/** Drop a directory subtree or a single file from an in-memory scan (after move/trash). */
+function removeSubtree(scan, rel) {
+  return removeMany(scan, [rel]);
 }
 
 /** Splice a freshly walked subtree (already prefixed with real rels) into the scan. */
@@ -380,7 +413,8 @@ function insertSubtree(scan, w, startRel) {
   scan.stats.largest = new TopN(scan.options?.topLargest || DEFAULTS.topLargest, [...scan.stats.largest, ...w.largest]).sorted();
   scan.stats.junk = [...scan.stats.junk, ...w.junk].sort((a, b) => b.size - a.size).slice(0, scan.options?.maxJunk || DEFAULTS.maxJunk);
   scan.errors = [...scan.errors.filter((e) => !(e.path === startRel || e.path.startsWith(`${startRel}/`))), ...w.errors].slice(0, 2000);
-  buildIndex(scan);
+  const index = indexOf(scan);
+  for (const d of w.dirs) index.set(d.rel, d);
   if (top && startRel !== '') {
     const parent = scan.index.get(parentOf(startRel));
     if (parent) { parent.subdirCount += 1; parent.empty = false; }
@@ -570,5 +604,5 @@ function formatBytes(bytes) {
 
 module.exports = {
   scanDirectory, summarize, listChildren, findDuplicates, formatBytes, hashFile,
-  removeSubtree, rescanSubtree, refreshDirShallow, refreshAffected, buildIndex, categoryTotals,
+  removeSubtree, removeMany, rescanSubtree, refreshDirShallow, refreshAffected, buildIndex, categoryTotals,
 };

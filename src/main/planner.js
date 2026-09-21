@@ -92,8 +92,12 @@ Reglas:
 - Los archivos se envían a la Papelera, no se borran definitivamente, pero sé prudente igualmente.
 - Máximo 200 sugerencias. Ordena de mayor a menor ahorro.`;
 
-function buildCleanupMessages(summary, duplicates, { instructions = '' } = {}) {
+function buildCleanupMessages(summary, duplicates, { instructions = '', isProtected: extra = null } = {}) {
   const now = Date.now();
+  const blocked = (rel) => isProtected(rel) || (extra ? extra(rel) : false);
+  summary = { ...summary, largest: summary.largest.filter((f) => !blocked(f.rel)), oldLarge: summary.oldLarge.filter((f) => !blocked(f.rel)), junk: summary.junk.filter((f) => !blocked(f.rel)) };
+  summary.junkBytes = summary.junk.reduce((a, f) => a + f.size, 0);
+  duplicates = duplicates ? { ...duplicates, groups: duplicates.groups.filter((g) => !g.files.some((f) => blocked(f.rel))) } : duplicates;
   const ageDays = (f) => Math.round((now - f.mtimeMs) / 86400000);
   const line = (f) => `${f.rel}\t${formatBytes(f.size)}\t${ageDays(f)} días`;
   const sections = [];
@@ -282,11 +286,12 @@ function fileLookup(scan) {
   return byRel;
 }
 
-function buildCleanupPlan(aiJson, scan, duplicates) {
+function buildCleanupPlan(aiJson, scan, duplicates, { isProtected: extra = null } = {}) {
   const byRel = fileLookup(scan);
   const seen = new Set();
   const suggestions = [];
   const rejected = [];
+  const blocked = (rel) => isProtected(rel) || (extra ? extra(rel) : false);
   const keepers = new Set((duplicates?.groups || []).map((g) => g.files[0].rel));
   const allowedConf = new Set(['alta', 'media', 'baja']);
 
@@ -296,7 +301,7 @@ function buildCleanupPlan(aiJson, scan, duplicates) {
     const file = byRel.get(rel);
     if (!file) { rejected.push({ path: rel, reason: 'No existe en el análisis' }); continue; }
     if (seen.has(rel)) continue;
-    if (isProtected(rel)) { rejected.push({ path: rel, reason: 'Carpeta protegida' }); continue; }
+    if (blocked(rel)) { rejected.push({ path: rel, reason: 'Carpeta protegida' }); continue; }
     seen.add(rel);
     const confidence = allowedConf.has(String(s.confidence).toLowerCase()) ? String(s.confidence).toLowerCase() : 'baja';
     suggestions.push({
@@ -312,6 +317,7 @@ function buildCleanupPlan(aiJson, scan, duplicates) {
   }
   // Ensure every duplicate group has all-but-one copy present even if the AI missed it.
   for (const g of duplicates?.groups || []) {
+    if (g.files.some((f) => blocked(f.rel))) continue;
     for (const f of g.files.slice(1)) {
       if (seen.has(f.rel)) continue;
       seen.add(f.rel);
@@ -328,7 +334,7 @@ function buildCleanupPlan(aiJson, scan, duplicates) {
     suggestions,
     rejected,
     totalBytes: suggestions.reduce((s, x) => s + x.size, 0),
-    emptyDirs: scan.dirs.filter((d) => d.empty && d.rel !== '' && !isProtected(d.rel)).map((d) => d.rel),
+    emptyDirs: scan.dirs.filter((d) => d.empty && d.rel !== '' && !blocked(d.rel)).map((d) => d.rel).slice(0, 5000),
   };
 }
 

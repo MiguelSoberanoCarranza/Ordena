@@ -50,6 +50,7 @@ contextBridge.exposeInMainWorld('ordena', {
     trashPath: (rel) => invoke('ops:trashPath', rel),
     journal: () => invoke('ops:journal'),
     undo: (id) => invoke('ops:undo', id),
+    cancel: () => invoke('ops:cancel'),
   },
   shell: {
     reveal: (rel) => invoke('shell:reveal', rel),

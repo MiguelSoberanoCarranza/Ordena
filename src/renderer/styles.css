@@ -271,3 +271,5 @@ details ul { margin: 6px 0 0; padding-left: 18px; font-family: var(--mono); font
 .open-option:hover { border-color: var(--accent); }
 .open-option input { margin-top: 3px; }
 .open-option .small { color: var(--text-3); }
+
+.opsbar { display: flex; align-items: center; gap: 14px; padding: 8px 22px; background: var(--accent-soft); border-bottom: 1px solid var(--border); }

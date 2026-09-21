@@ -2,7 +2,7 @@
 
 const { app, BrowserWindow, ipcMain, dialog, shell, safeStorage, Menu, nativeTheme } = require('electron');
 const path = require('path');
-const { scanDirectory, summarize, findDuplicates, listChildren, removeSubtree, rescanSubtree, refreshAffected } = require('./scanner');
+const { scanDirectory, summarize, findDuplicates, listChildren, removeSubtree, removeMany, rescanSubtree, refreshAffected } = require('./scanner');
 const { ScanCache } = require('./cache');
 const planner = require('./planner');
 const minimax = require('./minimax');
@@ -147,6 +147,13 @@ async function runAi(messages, { maxTokens } = {}) {
   } finally {
     if (state.aiAbort === controller) state.aiAbort = null;
   }
+}
+
+/** True when a scan-relative path must never be moved or deleted (system folders, .git, node_modules…). */
+function relProtected(scan, rel) {
+  const clean = String(rel || '').replace(/\\/g, '/');
+  const abs = clean ? path.join(scan.root, ...clean.split('/')) : scan.root;
+  return diskinfo.isProtectedAbs(abs) || planner.isProtected(clean);
 }
 
 /** Recompute summary after an in-memory or on-disk change and persist the scan in the background. */
@@ -359,10 +366,11 @@ handle('ai:cleanup', async (options = {}) => {
     const dupes = await findDuplicates(scan, { minSize: 1024, onProgress: (p) => send('dupes:progress', p) });
     state.duplicates = { ...dupes, groups: dupes.groups.slice(0, 500) };
   }
-  const messages = planner.buildCleanupMessages(state.summary, state.duplicates, { instructions: options.instructions || '' });
+  const guard = (rel) => relProtected(scan, rel);
+  const messages = planner.buildCleanupMessages(state.summary, state.duplicates, { instructions: options.instructions || '', isProtected: guard });
   const res = await runAi(messages, { maxTokens: 12000 });
   const json = minimax.extractJson(res.rawContent);
-  const plan = planner.buildCleanupPlan(json, scan, state.duplicates);
+  const plan = planner.buildCleanupPlan(json, scan, state.duplicates, { isProtected: guard });
   state.cleanupPlan = plan;
   return { plan, usage: res.usage, model: res.model, duplicates: state.duplicates };
 });
@@ -373,6 +381,8 @@ handle('ai:chat', async (history) => {
   const res = await runAi(messages, { maxTokens: 2048 });
   return { content: res.content, usage: res.usage };
 });
+
+handle('ops:cancel', async () => { state.opsCancel = true; return true; });
 
 handle('ai:cancel', async () => {
   if (state.aiAbort) state.aiAbort.abort();
@@ -388,7 +398,8 @@ handle('ops:applyMoves', async (moves) => {
   const scan = requireScan();
   if (!Array.isArray(moves) || moves.length === 0) throw new Error('No hay movimientos seleccionados');
   const clean = moves.map((m) => ({ from: String(m.from), to: String(m.to) }));
-  const result = await applyMoves(scan.root, clean, { journal, onProgress: (p) => send('ops:progress', p) });
+  state.opsCancel = false;
+  const result = await applyMoves(scan.root, clean, { journal, onProgress: (p) => send('ops:progress', { ...p, kind: 'move' }) });
   // Refresh only the folders involved so later actions see the new layout.
   await refreshAffected(scan, result.done.flatMap((m) => [m.from, m.to]));
   return { ...result, summary: afterMutation() };
@@ -397,15 +408,27 @@ handle('ops:applyMoves', async (moves) => {
 handle('ops:trash', async (paths) => {
   const scan = requireScan();
   if (!Array.isArray(paths) || paths.length === 0) throw new Error('No hay archivos seleccionados');
-  const result = await trashFiles(scan.root, paths.map(String), { journal, trashImpl: (abs) => shell.trashItem(abs), onProgress: (p) => send('ops:progress', p) });
-  for (const d of result.done) removeSubtree(scan, d.path);
+  state.opsCancel = false;
+  const result = await trashFiles(scan.root, paths.map(String), {
+    journal,
+    trashImpl: (abs) => shell.trashItem(abs),
+    isProtected: (abs) => diskinfo.isProtectedAbs(abs),
+    shouldCancel: () => state.opsCancel,
+    onProgress: (p) => send('ops:progress', { ...p, kind: 'trash' }),
+  });
+  removeMany(scan, result.done.map((d) => d.path));
   return { ...result, summary: afterMutation() };
 });
 
 handle('ops:removeEmptyDirs', async (dirs) => {
   const scan = requireScan();
-  const result = await removeEmptyDirs(scan.root, Array.isArray(dirs) ? dirs.map(String) : []);
-  for (const d of result.done) removeSubtree(scan, d);
+  state.opsCancel = false;
+  const result = await removeEmptyDirs(scan.root, Array.isArray(dirs) ? dirs.map(String) : [], {
+    isProtected: (abs) => diskinfo.isProtectedAbs(abs),
+    shouldCancel: () => state.opsCancel,
+    onProgress: (p) => send('ops:progress', { ...p, kind: 'emptydirs' }),
+  });
+  removeMany(scan, result.done);
   return { ...result, summary: afterMutation() };
 });
 

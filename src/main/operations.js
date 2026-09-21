@@ -140,15 +140,17 @@ async function undoMoves(entry, { journal } = {}) {
 }
 
 /** Send files to the system trash. `trashImpl` is Electron's shell.trashItem (injectable for tests). */
-async function trashFiles(root, rels, { trashImpl, journal, onProgress } = {}) {
+async function trashFiles(root, rels, { trashImpl, journal, onProgress, isProtected, shouldCancel } = {}) {
   if (typeof trashImpl !== 'function') throw new Error('No hay implementación de papelera disponible');
   const done = [];
   const failed = [];
   let bytes = 0;
   for (let i = 0; i < rels.length; i += 1) {
     const rel = rels[i];
+    if (shouldCancel && shouldCancel()) { failed.push({ path: rel, error: 'Cancelado' }); continue; }
     try {
       const abs = resolveInside(root, rel);
+      if (isProtected && isProtected(abs)) throw new Error('Ruta del sistema protegida');
       const st = await fsp.stat(abs);
       await trashImpl(abs);
       bytes += st.size;
@@ -172,13 +174,17 @@ async function trashFiles(root, rels, { trashImpl, journal, onProgress } = {}) {
   return { journalId: entry.id, done, failed, bytes };
 }
 
-async function removeEmptyDirs(root, rels) {
+async function removeEmptyDirs(root, rels, { isProtected, onProgress, shouldCancel } = {}) {
   const done = [];
   const failed = [];
   const sorted = [...rels].sort((a, b) => b.length - a.length);
-  for (const rel of sorted) {
+  for (let i = 0; i < sorted.length; i += 1) {
+    const rel = sorted[i];
+    if (shouldCancel && shouldCancel()) { failed.push({ path: rel, error: 'Cancelado' }); continue; }
+    if (onProgress && i % 25 === 0) onProgress({ current: i + 1, total: sorted.length });
     try {
       const abs = resolveInside(root, rel);
+      if (isProtected && isProtected(abs)) throw new Error('Ruta del sistema protegida');
       const items = await fsp.readdir(abs);
       if (items.length > 0) throw new Error('La carpeta no está vacía');
       await fsp.rmdir(abs);

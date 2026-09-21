@@ -40,6 +40,13 @@
         <div class="api-badge" id="apiBadge" title="Estado de la API de MiniMax"></div>
       </header>
 
+      <div class="opsbar" id="opsBar" hidden>
+        <div class="grow">
+          <div class="row between small"><span id="opsText">Procesando…</span><span id="opsPct"></span></div>
+          <div class="progress-bar"><div class="progress-bar-fill" id="opsFill"></div></div>
+        </div>
+        <button class="btn btn-sm" id="btnOpsCancel">Detener</button>
+      </div>
       <div class="banner banner-warn" id="apiBanner" hidden>
         <span>Para usar la IA necesitas una clave de API de MiniMax.</span>
         <button class="btn btn-sm" data-view="settings">Configurar ahora</button>
@@ -228,6 +235,7 @@
               </div>
             </div>
             <table class="table" id="cleanupTable"><thead><tr><th></th><th>Archivo</th><th>Motivo</th><th>Confianza</th><th class="num">Tamaño</th><th></th></tr></thead><tbody></tbody></table>
+            <div class="row end mt-s" id="cleanupMoreRow" hidden><button class="btn btn-ghost btn-sm" id="btnCleanupMore"></button></div>
             <div class="actionbar">
               <span id="cleanupSelectedText" class="muted"></span>
               <button class="btn btn-danger" id="btnTrash">Enviar a la Papelera</button>
@@ -235,7 +243,7 @@
           </div>
           <div class="card" id="emptyDirsCard" hidden>
             <div class="row between">
-              <h3>Carpetas vacías <span class="muted" id="emptyDirsCount"></span></h3>
+              <div><h3>Carpetas vacías <span class="muted" id="emptyDirsCount"></span></h3><div class="small muted">Se omiten las carpetas del sistema. Solo se eliminan carpetas sin ningún archivo dentro.</div></div>
               <button class="btn" id="btnRemoveEmpty">Eliminar carpetas vacías</button>
             </div>
             <div class="chips" id="emptyDirsList"></div>

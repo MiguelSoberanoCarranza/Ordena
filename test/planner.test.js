@@ -141,3 +141,18 @@ test('buildExplainMessages / buildExplainResult', () => {
   assert.equal(res.items[0].delete, 'parcial');
   assert.deepEqual(res.plan, ['Mover Vídeos a D:']);
 });
+
+test('cleanup plan and prompt exclude protected paths', () => {
+  const guard = (rel) => rel.startsWith('Windows/');
+  const sys = file('Windows/Temp/x.tmp', 999, 400, { junk: true });
+  const s2 = { ...scan, files: [...scan.files, sys], stats: { ...scan.stats, largest: [sys, ...scan.stats.largest], junk: [sys] } };
+  s2.dirs = [...scan.dirs, { rel: 'Windows', empty: false, depth: 1 }, { rel: 'Windows/vacia', empty: true, depth: 2 }];
+  const sum = summarize(s2);
+  const msgs = planner.buildCleanupMessages(sum, null, { isProtected: guard });
+  assert.doesNotMatch(msgs[1].content, /Windows\/Temp/);
+  const plan = planner.buildCleanupPlan({ suggestions: [{ path: 'Windows/Temp/x.tmp', confidence: 'alta' }, { path: 'setup.exe', confidence: 'alta' }] }, s2, null, { isProtected: guard });
+  assert.deepEqual(plan.suggestions.map((x) => x.path), ['setup.exe']);
+  assert.equal(plan.rejected[0].reason, 'Carpeta protegida');
+  assert.ok(!plan.emptyDirs.includes('Windows/vacia'));
+  assert.ok(plan.emptyDirs.includes('vacia'));
+});

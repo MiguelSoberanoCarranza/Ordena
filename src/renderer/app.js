@@ -85,6 +85,7 @@ function confirmDialog({ title, bodyHtml, okText = 'Confirmar', danger = false }
 
 function setBusy(v) {
   state.busy = v;
+  if (!v) { clearTimeout(opsBarTimer); $('#opsBar').hidden = true; }
   $$('.btn-primary, .btn-danger').forEach((b) => { if (!b.closest('#modal')) b.disabled = v; });
 }
 
@@ -805,7 +806,12 @@ function renderCleanupPlan() {
   $('#cleanupSummary').textContent = plan.summary || 'Análisis completado.';
   $('#cleanupTips').innerHTML = plan.tips.map((t) => `<li>${esc(t)}</li>`).join('');
   const visible = new Set($$('.conf-filter:checked').map((c) => c.value));
-  $('#cleanupTable tbody').innerHTML = plan.suggestions.length ? plan.suggestions.map((s, i) => `
+  const limit = state.cleanupLimit || 300;
+  const shown = plan.suggestions.slice(0, limit);
+  const moreRow = $('#cleanupMoreRow');
+  moreRow.hidden = plan.suggestions.length <= limit;
+  $('#btnCleanupMore').textContent = `Mostrar ${Math.min(500, plan.suggestions.length - limit)} más (${fmtInt(plan.suggestions.length - limit)} ocultas)`;
+  $('#cleanupTable tbody').innerHTML = shown.length ? shown.map((s, i) => `
     <tr data-conf="${s.confidence}" ${visible.has(s.confidence) ? '' : 'hidden'}>
       <td><input type="checkbox" class="cl-check" data-index="${i}" ${s.confidence === 'alta' ? 'checked' : ''} /></td>
       <td>${pathHtml(s.path)}<div class="small muted">${esc(s.category)} · ${fmtDate(s.mtimeMs)}</div></td>
@@ -831,6 +837,7 @@ function applyConfFilter() {
   updateCleanupSelection();
 }
 $$('.conf-filter').forEach((c) => c.addEventListener('change', applyConfFilter));
+$('#btnCleanupMore').addEventListener('click', () => { state.cleanupLimit = (state.cleanupLimit || 300) + 500; renderCleanupPlan(); });
 
 function selectedCleanup() {
   const plan = state.cleanupPlan;
@@ -841,7 +848,8 @@ function selectedCleanup() {
 function updateCleanupSelection() {
   const sel = selectedCleanup();
   const bytes = sel.reduce((a, s) => a + s.size, 0);
-  $('#cleanupSelectedText').textContent = sel.length ? `${sel.length} archivo${sel.length === 1 ? '' : 's'} · liberarías ${fmtBytes(bytes)}` : 'Nada seleccionado';
+  const hidden = state.cleanupPlan ? Math.max(0, state.cleanupPlan.suggestions.length - (state.cleanupLimit || 300)) : 0;
+  $('#cleanupSelectedText').textContent = (sel.length ? `${sel.length} archivo${sel.length === 1 ? '' : 's'} · liberarías ${fmtBytes(bytes)}` : 'Nada seleccionado') + (hidden ? ` · ${fmtInt(hidden)} sugerencias no mostradas (pulsa "Mostrar más" para verlas)` : '');
   $('#btnTrash').disabled = sel.length === 0 || state.busy;
   $('#btnTrash').textContent = sel.length ? `Enviar ${sel.length} a la Papelera (${fmtBytes(bytes)})` : 'Enviar a la Papelera';
 }
@@ -858,6 +866,7 @@ $('#btnCleanup').addEventListener('click', async () => {
   try {
     const { plan, duplicates } = await ordena.ai.cleanup({ instructions: $('#cleanupInstructions').value });
     state.cleanupPlan = plan;
+    state.cleanupLimit = 300;
     state.duplicates = duplicates;
     renderAnalysis();
     renderDuplicates();
@@ -1001,9 +1010,21 @@ async function loadHistory() {
 $('#btnOpenTrash').addEventListener('click', () => ordena.shell.openTrash().catch(() => {}));
 
 // ---------- ops progress ----------
+const OPS_LABEL = { trash: 'Enviando a la Papelera', move: 'Moviendo archivos', emptydirs: 'Eliminando carpetas vacías' };
+let opsBarTimer = null;
 ordena.onOpsProgress((p) => {
-  if (p.kind !== 'relocate' && p.total > 20) toast(`Procesando ${p.current}/${p.total}…`);
+  if (p.kind === 'relocate') return;
+  if (!(p.total > 20)) return;
+  const bar = $('#opsBar');
+  bar.hidden = false;
+  const pct = Math.round((p.current / p.total) * 100);
+  $('#opsFill').style.width = `${pct}%`;
+  $('#opsPct').textContent = `${fmtInt(p.current)} / ${fmtInt(p.total)}`;
+  $('#opsText').textContent = `${OPS_LABEL[p.kind] || 'Procesando'}…`;
+  clearTimeout(opsBarTimer);
+  if (p.current >= p.total) opsBarTimer = setTimeout(() => { bar.hidden = true; }, 1200);
 });
+$('#btnOpsCancel').addEventListener('click', () => { ordena.ops.cancel(); $('#opsText').textContent = 'Deteniendo… se conserva lo ya hecho'; });
 
 // ---------- init ----------
 
