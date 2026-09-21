@@ -71,3 +71,30 @@ test('formatBytes', () => {
   assert.equal(formatBytes(1536), '1.5 KB');
   assert.equal(formatBytes(50 * 1024 * 1024), '50 MB');
 });
+
+test('disk mode aggregates directory sizes and keeps only large files', async () => {
+  const dir = makeFixture();
+  const scan = await scanDirectory(dir, { mode: 'disk', minStoreSize: 4000 });
+  assert.equal(scan.mode, 'disk');
+  assert.equal(scan.totalFiles, 6);
+  assert.deepEqual(scan.files.map((f) => f.name), ['informe.pdf']); // only file >= 4000 bytes stored
+  const root = scan.dirs.find((d) => d.rel === '');
+  assert.equal(root.size, scan.totalSize);
+  assert.equal(root.fileCount, 6);
+  const sub = scan.dirs.find((d) => d.rel === 'sub');
+  assert.equal(sub.size, 3004);
+  assert.equal(sub.fileCount, 2);
+  assert.equal(scan.stats.largest[0].name, 'informe.pdf');
+  assert.equal(scan.stats.junkCount, 1);
+  assert.equal(scan.stats.categories[0].category, 'Imágenes');
+
+  const { listChildren } = require('../src/main/scanner');
+  const level = listChildren(scan, '');
+  assert.equal(level.dirs[0].rel, 'sub');
+  assert.equal(level.files.length, 1);
+  const subLevel = listChildren(scan, 'sub');
+  assert.deepEqual(subLevel.crumbs.map((c) => c.rel), ['sub']);
+  assert.equal(subLevel.files.length, 0); // small files not stored in disk mode
+  assert.equal(listChildren(scan, 'nope'), null);
+  fs.rmSync(dir, { recursive: true, force: true });
+});

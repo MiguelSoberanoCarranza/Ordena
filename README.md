@@ -3,6 +3,8 @@
 Aplicación de escritorio para **Windows y macOS** que analiza una carpeta, propone cómo **organizar tus archivos** y te ayuda a **liberar espacio**, con la ayuda de la IA de [MiniMax](https://platform.minimax.io).
 
 - **Análisis local**: qué ocupa espacio por tipo, tamaño y antigüedad; duplicados exactos; archivos temporales; carpetas vacías.
+- **Explorar un disco completo**: analiza `C:\`, `Macintosh HD` o la carpeta de usuario entera y navega por las carpetas ordenadas por tamaño. Cada carpeta se etiqueta (sistema, aplicaciones, caché, usuario, juegos, desarrollo…) y las conocidas traen una explicación de qué son y cómo reducirlas. El botón **Explicar con IA** pide a MiniMax un plan concreto para ese nivel.
+- **Mover a otro disco**: copia una carpeta pesada (Vídeos, bibliotecas de juegos, Docker, copias de iPhone…) a otro disco, verifica la copia, borra el original y deja un enlace (junction en Windows, symlink en macOS) para que los programas la sigan encontrando. Reversible desde Historial.
 - **Organizar con IA**: MiniMax propone una estructura de carpetas y movimientos concretos. Tú revisas, marcas lo que quieres y aplicas. Todo se puede **deshacer** desde Historial.
 - **Liberar espacio con IA**: sugerencias con nivel de confianza (alta / media / baja) y motivo. Los archivos van a la **Papelera**, nunca se borran directamente.
 - **Preguntar**: chat con contexto de la carpeta ("¿qué puedo borrar para ganar 5 GB?").
@@ -22,7 +24,7 @@ Aplicación de escritorio para **Windows y macOS** que analiza una carpeta, prop
 5. En **Liberar espacio**, pulsa **Analizar con IA**, revisa las sugerencias y envía a la Papelera las que apruebes.
 6. Si algo no te gusta, ve a **Historial** y pulsa **Deshacer**.
 
-Por seguridad la app no permite analizar el disco completo ni la carpeta de usuario entera; elige una subcarpeta concreta. Nunca toca carpetas `.git`, `node_modules` ni similares.
+Al analizar un disco completo o la carpeta de usuario, Ordena pasa a un modo ligero: calcula el tamaño de todas las carpetas y guarda el detalle solo de los archivos de 1 MB o más. Las carpetas del sistema (`Windows`, `Program Files`, `/System`, `/Library`…) se muestran pero están protegidas: nunca se mueven ni se borran, y tampoco se tocan `.git` ni `node_modules`.
 
 ## Desarrollo
 
@@ -38,9 +40,9 @@ Variables útiles durante el desarrollo:
 | Variable | Efecto |
 |---|---|
 | `MINIMAX_API_KEY` | Clave usada si no hay ninguna guardada en Ajustes |
-| `ORDENA_DEV_SCAN=/ruta` | Analiza esa carpeta al arrancar |
+| `ORDENA_DEV_SCAN=/ruta` | Analiza esa carpeta al arrancar (`ORDENA_DEV_SCAN_MODE=disk` fuerza el modo disco) |
 | `ORDENA_DEV_VIEW=organize` | Muestra esa vista al arrancar |
-| `ORDENA_DEV_ACTION=organize\|cleanup\|dupes` | Dispara esa acción al arrancar |
+| `ORDENA_DEV_ACTION=organize\|cleanup\|dupes\|explain` | Dispara esa acción al arrancar |
 | `ORDENA_SCREENSHOT=/ruta.png` | Captura la ventana y cierra (útil en CI) |
 
 ## Generar instaladores
@@ -64,10 +66,11 @@ git tag v0.1.0 && git push origin v0.1.0
 ```
 src/main/        proceso principal de Electron
   main.js        ventana, menú, IPC
-  scanner.js     recorrido de carpetas, resumen, duplicados (sha1 por tamaño → parcial → completo)
+  scanner.js     recorrido de carpetas, tamaños por carpeta, resumen, duplicados (sha1 por tamaño → parcial → completo)
+  diskinfo.js    discos montados y espacio libre, base de conocimiento de rutas del sistema, rutas protegidas
   planner.js     prompts para MiniMax y validación de sus respuestas (rutas seguras, sin cambiar extensiones)
   minimax.js     cliente de la API compatible con OpenAI (Bearer, manejo de <think>, errores base_resp)
-  operations.js  mover, enviar a la Papelera, borrar carpetas vacías, diario de operaciones y deshacer
+  operations.js  mover, trasladar a otro disco, enviar a la Papelera, borrar carpetas vacías, diario y deshacer
   settings.js    ajustes y clave de API cifrada con safeStorage
 src/preload/     puente seguro (contextIsolation + sandbox)
 src/renderer/    interfaz (HTML/CSS/JS sin dependencias)

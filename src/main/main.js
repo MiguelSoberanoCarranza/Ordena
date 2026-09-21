@@ -2,11 +2,13 @@
 
 const { app, BrowserWindow, ipcMain, dialog, shell, safeStorage, Menu, nativeTheme } = require('electron');
 const path = require('path');
-const { scanDirectory, summarize, findDuplicates } = require('./scanner');
+const { scanDirectory, summarize, findDuplicates, listChildren, removeSubtree } = require('./scanner');
 const planner = require('./planner');
 const minimax = require('./minimax');
-const { Journal, applyMoves, undoMoves, trashFiles, removeEmptyDirs } = require('./operations');
+const { Journal, applyMoves, undoMoves, trashFiles, removeEmptyDirs, relocate, undoRelocate } = require('./operations');
 const { Settings } = require('./settings');
+const diskinfo = require('./diskinfo');
+const { resolveInside } = require('./paths');
 
 const isMac = process.platform === 'darwin';
 let mainWindow = null;
@@ -19,6 +21,8 @@ const state = {
   organizePlan: null,
   cleanupPlan: null,
   aiAbort: null,
+  scanCancel: false,
+  opsCancel: false,
 };
 
 const settings = new Settings({ file: path.join(app.getPath('userData'), 'settings.json'), safeStorage });
@@ -55,7 +59,7 @@ function createWindow() {
 
   // Developer hooks: ORDENA_DEV_SCAN=<carpeta> analiza al arrancar; ORDENA_SCREENSHOT=<png> captura y cierra.
   mainWindow.webContents.once('did-finish-load', async () => {
-    if (process.env.ORDENA_DEV_SCAN) send('dev:scan', process.env.ORDENA_DEV_SCAN);
+    if (process.env.ORDENA_DEV_SCAN) send('dev:scan', { root: process.env.ORDENA_DEV_SCAN, mode: process.env.ORDENA_DEV_SCAN_MODE || undefined });
     if (process.env.ORDENA_DEV_ACTION) setTimeout(() => send('dev:action', process.env.ORDENA_DEV_ACTION), 1200);
     if (process.env.ORDENA_SCREENSHOT) {
       const delay = Number(process.env.ORDENA_SCREENSHOT_DELAY || 2500);
@@ -172,6 +176,7 @@ handle('dialog:pickFolder', async () => {
 });
 
 handle('app:commonFolders', async () => ({
+  home: app.getPath('home'),
   downloads: app.getPath('downloads'),
   desktop: app.getPath('desktop'),
   documents: app.getPath('documents'),
@@ -180,17 +185,118 @@ handle('app:commonFolders', async () => ({
   music: app.getPath('music'),
 }));
 
-handle('scan:start', async (root) => {
+function targetInfo(root) {
+  const abs = path.resolve(root);
+  const isDriveRoot = path.parse(abs).root === abs;
+  const isHome = abs === path.resolve(app.getPath('home'));
+  return { path: abs, isDriveRoot, isHome, suggestedMode: isDriveRoot || isHome ? 'disk' : 'folder' };
+}
+
+handle('app:targetInfo', async (root) => targetInfo(root));
+handle('app:drives', async () => diskinfo.listDrives());
+
+handle('scan:start', async (root, options = {}) => {
   if (typeof root !== 'string' || !root) throw new Error('Carpeta inválida');
-  const forbidden = [app.getPath('home'), path.parse(root).root];
-  if (forbidden.includes(path.resolve(root))) {
-    throw new Error('Por seguridad, elige una subcarpeta concreta (Descargas, Escritorio, Documentos…) en lugar de todo el disco o la carpeta de usuario.');
-  }
+  const info = targetInfo(root);
+  const mode = options.mode === 'disk' || options.mode === 'folder' ? options.mode : info.suggestedMode;
   state.scan = null; state.summary = null; state.duplicates = null; state.organizePlan = null; state.cleanupPlan = null;
-  const scan = await scanDirectory(root, { onProgress: (p) => send('scan:progress', p) });
+  state.scanCancel = false;
+  const scan = await scanDirectory(root, {
+    mode,
+    onProgress: (p) => send('scan:progress', p),
+    shouldCancel: () => state.scanCancel,
+  });
   state.scan = scan;
   state.summary = summarize(scan);
   return { summary: state.summary, errors: scan.errors.slice(0, 50) };
+});
+
+handle('scan:cancel', async () => { state.scanCancel = true; return true; });
+
+function enrichEntry(scan, e, isDir) {
+  const abs = e.rel ? path.join(scan.root, ...e.rel.split('/')) : scan.root;
+  const hint = diskinfo.describePath(abs);
+  return {
+    ...e,
+    isDir,
+    abs,
+    kind: hint ? hint.kind : (isDir ? diskinfo.guessKind(abs) : (e.junk ? 'temporal' : e.category)),
+    hint,
+    protected: diskinfo.isProtectedAbs(abs) || planner.isProtected(e.rel || ''),
+  };
+}
+
+handle('scan:children', async (rel) => {
+  const scan = requireScan();
+  const level = listChildren(scan, rel);
+  if (!level) throw new Error('Carpeta no encontrada en el análisis');
+  return {
+    ...level,
+    abs: level.rel ? path.join(scan.root, ...level.rel.split('/')) : scan.root,
+    dirs: level.dirs.map((d) => enrichEntry(scan, d, true)),
+    files: level.files.map((f) => enrichEntry(scan, f, false)),
+  };
+});
+
+handle('ai:explain', async (rels) => {
+  const scan = requireScan();
+  if (!Array.isArray(rels) || rels.length === 0) throw new Error('Nada que explicar');
+  const items = [];
+  for (const rel of rels.slice(0, 40).map(String)) {
+    const d = scan.dirs.find((x) => x.rel === rel);
+    const f = d ? null : [...scan.files, ...scan.stats.largest].find((x) => x.rel === rel);
+    if (!d && !f) continue;
+    const e = enrichEntry(scan, d || f, Boolean(d));
+    items.push({ path: e.abs, rel, size: e.size, isDir: Boolean(d), fileCount: d ? d.fileCount : 1, kind: e.kind, hint: e.hint });
+  }
+  const drives = await diskinfo.listDrives().catch(() => []);
+  const messages = planner.buildExplainMessages(scan.root, items, { drives });
+  const res = await runAi(messages, { maxTokens: 8000 });
+  const json = minimax.extractJson(res.rawContent);
+  const result = planner.buildExplainResult(json, items);
+  const byPath = new Map(items.map((i) => [i.path, i.rel]));
+  result.items = result.items.map((i) => ({ ...i, rel: byPath.get(i.path) }));
+  return { ...result, usage: res.usage };
+});
+
+handle('dialog:pickDestination', async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: 'Elige la carpeta de destino en el otro disco',
+    properties: ['openDirectory', 'createDirectory'],
+  });
+  if (result.canceled || result.filePaths.length === 0) return null;
+  return result.filePaths[0];
+});
+
+handle('ops:relocate', async (rel, destDir, options = {}) => {
+  const scan = requireScan();
+  if (typeof destDir !== 'string' || !destDir) throw new Error('Elige una carpeta de destino');
+  const srcAbs = resolveInside(scan.root, rel);
+  const result = await relocate(srcAbs, destDir, {
+    leaveLink: options.leaveLink !== false,
+    journal,
+    isProtected: (abs) => diskinfo.isProtectedAbs(abs),
+    onProgress: (p) => send('ops:progress', { ...p, kind: 'relocate' }),
+  });
+  removeSubtree(scan, rel);
+  state.summary = summarize(scan);
+  state.duplicates = null;
+  return { ...result, summary: state.summary };
+});
+
+handle('ops:trashPath', async (rel) => {
+  const scan = requireScan();
+  const abs = resolveInside(scan.root, rel);
+  if (diskinfo.isProtectedAbs(abs) || planner.isProtected(rel)) throw new Error('Esta ruta es del sistema y no se puede eliminar.');
+  const st = await require('fs/promises').stat(abs);
+  const node = st.isDirectory() ? scan.dirs.find((d) => d.rel === rel) : null;
+  const bytes = node ? node.size : st.size;
+  await shell.trashItem(abs);
+  await journal.append({ id: require('crypto').randomUUID(), type: 'trash', root: scan.root, at: new Date().toISOString(), count: node ? node.fileCount : 1, bytes, entries: [{ path: rel }], undone: false });
+  removeSubtree(scan, rel);
+  state.summary = summarize(scan);
+  state.duplicates = null;
+  return { bytes, summary: state.summary };
 });
 
 handle('scan:duplicates', async () => {
@@ -285,8 +391,12 @@ handle('ops:undo', async (id) => {
   const entries = await journal.read();
   const entry = entries.find((e) => e.id === id);
   if (!entry) throw new Error('Operación no encontrada');
-  if (entry.type !== 'move') throw new Error('Los archivos enviados a la Papelera se recuperan desde la Papelera del sistema.');
   if (entry.undone) throw new Error('Esta operación ya fue deshecha');
+  if (entry.type === 'relocate') {
+    const r = await undoRelocate(entry, { journal, onProgress: (p) => send('ops:progress', { ...p, kind: 'relocate' }) });
+    return { restored: [{ from: entry.dest, to: r.restored }], failed: [], summary: state.summary, needsRescan: true };
+  }
+  if (entry.type !== 'move') throw new Error('Los archivos enviados a la Papelera se recuperan desde la Papelera del sistema.');
   const result = await undoMoves(entry, { journal });
   if (state.scan && state.scan.root === entry.root) {
     state.scan = await scanDirectory(entry.root);
@@ -298,14 +408,12 @@ handle('ops:undo', async (id) => {
 
 handle('shell:reveal', async (rel) => {
   const scan = requireScan();
-  const { resolveInside } = require('./paths');
   shell.showItemInFolder(resolveInside(scan.root, rel));
   return true;
 });
 
 handle('shell:open', async (rel) => {
   const scan = requireScan();
-  const { resolveInside } = require('./paths');
   const err = await shell.openPath(resolveInside(scan.root, rel));
   if (err) throw new Error(err);
   return true;

@@ -16,6 +16,7 @@
       <nav class="nav" id="nav">
         <button class="nav-item active" data-view="home"><span class="nav-icon">📁</span>Carpeta</button>
         <button class="nav-item" data-view="analysis" data-needs-scan><span class="nav-icon">📊</span>Análisis</button>
+        <button class="nav-item" data-view="disk" data-needs-scan><span class="nav-icon">💽</span>Explorar</button>
         <button class="nav-item" data-view="organize" data-needs-scan><span class="nav-icon">🗂️</span>Organizar</button>
         <button class="nav-item" data-view="cleanup" data-needs-scan><span class="nav-icon">🧹</span>Liberar espacio</button>
         <button class="nav-item" data-view="chat" data-needs-scan><span class="nav-icon">💬</span>Preguntar</button>
@@ -51,10 +52,21 @@
           <p class="muted">Ordena analiza tus archivos localmente. Solo se envía a MiniMax una lista con nombres, tamaños y fechas, nunca el contenido de tus archivos.</p>
           <div class="quick-folders" id="quickFolders"></div>
           <button class="btn btn-primary btn-lg" id="btnPick">Elegir otra carpeta…</button>
-          <div class="progress" id="scanProgress" hidden>
+          <div class="progress progress-block" id="scanProgress" hidden>
             <div class="spinner"></div>
-            <div><strong>Analizando…</strong> <span id="scanProgressText"></span></div>
+            <div class="grow">
+              <div><strong>Analizando…</strong> <span id="scanProgressText"></span></div>
+              <div class="small muted path" id="scanProgressDir"></div>
+            </div>
+            <button class="btn btn-sm" id="btnCancelScan">Cancelar</button>
           </div>
+        </div>
+        <div class="card drives-card" id="drivesCard" hidden>
+          <div class="row between">
+            <h3>Discos del equipo</h3>
+            <span class="small muted">Analiza un disco entero para ver qué lo llena y qué puedes mover a otro.</span>
+          </div>
+          <div id="drivesList"></div>
         </div>
         <div class="features">
           <div class="feature"><h3>📊 Análisis</h3><p>Qué ocupa espacio: por tipo, tamaño y antigüedad. Detecta duplicados y archivos temporales.</p></div>
@@ -82,6 +94,10 @@
             <div class="chips" id="extChips"></div>
           </div>
         </div>
+        <div class="card" id="topDirsCard" hidden>
+          <div class="row between"><h3>Carpetas que más ocupan</h3><button class="btn btn-sm" data-view="disk">Explorar</button></div>
+          <div class="bars" id="topDirsBars"></div>
+        </div>
         <div class="card">
           <h3>Archivos más grandes</h3>
           <table class="table" id="largestTable"><thead><tr><th>Archivo</th><th>Categoría</th><th>Modificado</th><th class="num">Tamaño</th><th></th></tr></thead><tbody></tbody></table>
@@ -93,6 +109,39 @@
         <div class="card" id="errorsCard" hidden>
           <h3>Avisos del análisis</h3>
           <ul class="small" id="errorsList"></ul>
+        </div>
+      </section>
+
+      <!-- DISK EXPLORER -->
+      <section class="view" id="view-disk">
+        <div class="view-header">
+          <div>
+            <h2>Explorar el espacio</h2>
+            <div class="crumbs" id="diskCrumbs"></div>
+          </div>
+          <div class="row gap">
+            <button class="btn btn-ghost btn-sm" id="btnDiskUp">↑ Subir</button>
+            <button class="btn btn-primary" id="btnExplain">🤖 Explicar con IA</button>
+          </div>
+        </div>
+        <div class="tiles" id="diskTiles"></div>
+        <div class="card explain-card" id="explainCard" hidden>
+          <div class="row between"><h3>Qué es y qué hacer</h3><button class="btn btn-ghost btn-sm" id="btnExplainClose">Ocultar</button></div>
+          <p class="lead" id="explainSummary"></p>
+          <ol class="plan" id="explainPlan"></ol>
+        </div>
+        <div class="progress" id="explainProgress" hidden><div class="spinner"></div><div>MiniMax está analizando estas carpetas…</div></div>
+        <div class="card">
+          <h3>Carpetas <span class="muted small" id="diskDirsNote"></span></h3>
+          <table class="table table-disk" id="diskDirsTable"><thead><tr><th>Carpeta</th><th>Tipo</th><th class="num">Tamaño</th><th class="num">Archivos</th><th></th></tr></thead><tbody></tbody></table>
+        </div>
+        <div class="card">
+          <h3>Archivos en esta carpeta <span class="muted small" id="diskFilesNote"></span></h3>
+          <table class="table table-disk" id="diskFilesTable"><thead><tr><th>Archivo</th><th>Tipo</th><th class="num">Tamaño</th><th>Modificado</th><th></th></tr></thead><tbody></tbody></table>
+        </div>
+        <div class="progress-bar-wrap" id="relocateProgress" hidden>
+          <div class="row between small"><span id="relocateText">Moviendo…</span><span id="relocatePct"></span></div>
+          <div class="progress-bar"><div class="progress-bar-fill" id="relocateFill"></div></div>
         </div>
       </section>
 
@@ -207,7 +256,7 @@
       <!-- HISTORY -->
       <section class="view" id="view-history">
         <div class="view-header"><h2>Historial de operaciones</h2><button class="btn btn-ghost btn-sm" id="btnOpenTrash">Abrir Papelera</button></div>
-        <p class="muted">Los movimientos se pueden deshacer desde aquí. Los archivos enviados a la Papelera se recuperan desde la Papelera del sistema.</p>
+        <p class="muted">Los movimientos y los traslados a otro disco se pueden deshacer desde aquí. Los archivos enviados a la Papelera se recuperan desde la Papelera del sistema.</p>
         <div id="historyList"></div>
       </section>
 

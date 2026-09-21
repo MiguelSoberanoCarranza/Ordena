@@ -14,6 +14,10 @@ const state = {
   chat: [],
   settings: null,
   busy: false,
+  diskRel: '',
+  diskLevel: null,
+  explanations: new Map(),
+  drives: [],
 };
 
 // ---------- utils ----------
@@ -172,29 +176,53 @@ $('#linkGetKey').addEventListener('click', (e) => {
 
 // ---------- folder selection & scan ----------
 
-async function scanFolder(root) {
+async function scanFolder(root, options = {}) {
   if (!root) return;
+  let mode = options.mode;
+  try {
+    const info = await ordena.targetInfo(root);
+    if (!mode) mode = info.suggestedMode;
+    if (mode === 'disk' && !options.confirmed) {
+      const ok = await confirmDialog({
+        title: info.isDriveRoot ? 'Analizar el disco completo' : 'Analizar toda la carpeta de usuario',
+        bodyHtml: `<p>Se recorrerán <strong>todas</strong> las carpetas de <code>${esc(info.path)}</code>. En un disco con muchos archivos puede tardar varios minutos; puedes cancelarlo en cualquier momento.</p>
+          <p class="small muted">En este modo Ordena calcula el tamaño de cada carpeta y guarda el detalle de los archivos de 1 MB o más, que son los que importan para liberar espacio. Las carpetas del sistema se muestran pero están protegidas: nunca se mueven ni se borran.</p>`,
+        okText: 'Analizar',
+      });
+      if (!ok) return;
+    }
+  } catch (err) {
+    toast(err.message, 'error');
+    return;
+  }
   const progress = $('#scanProgress');
   progress.hidden = false;
   $('#scanProgressText').textContent = '';
+  $('#scanProgressDir').textContent = '';
+  showView('home');
   setBusy(true);
   try {
-    const { summary, errors } = await ordena.scan(root);
+    const { summary, errors } = await ordena.scan(root, { mode });
     state.root = root;
     state.summary = summary;
     state.duplicates = null;
     state.organizePlan = null;
     state.cleanupPlan = null;
+    state.diskRel = '';
+    state.diskLevel = null;
+    state.explanations = new Map();
     $('#organizeResult').hidden = true;
     $('#cleanupResult').hidden = true;
     $('#dupesCard').hidden = true;
+    $('#explainCard').hidden = true;
     $('#folderPill').hidden = false;
     $('#folderPath').textContent = root;
     $('#folderPath').title = root;
     renderAnalysis(errors);
     updateNavAvailability();
-    showView('analysis');
-    if (summary.truncated) toast('La carpeta es muy grande: se analizaron los primeros 60 000 archivos.', 'error');
+    if (summary.mode === 'disk') { await loadDisk(''); showView('disk'); } else showView('analysis');
+    if (summary.cancelled) toast('Análisis cancelado: se muestran los datos recogidos hasta ahora.', 'error');
+    else if (summary.truncated) toast(summary.mode === 'disk' ? 'Hay tantos archivos grandes que solo se guardó el detalle de los primeros 250 000.' : 'La carpeta es muy grande: se analizaron los primeros 60 000 archivos.', 'error');
   } catch (err) {
     toast(err.message, 'error');
   } finally {
@@ -205,19 +233,43 @@ async function scanFolder(root) {
 
 ordena.onScanProgress((p) => {
   $('#scanProgressText').textContent = `${fmtInt(p.files)} archivos · ${fmtBytes(p.bytes)}`;
+  if (p.current) $('#scanProgressDir').textContent = p.current;
 });
+$('#btnCancelScan').addEventListener('click', () => { ordena.cancelScan(); $('#btnCancelScan').textContent = 'Cancelando…'; });
+
+async function renderDrives() {
+  try {
+    state.drives = await ordena.drives();
+  } catch { state.drives = []; }
+  const card = $('#drivesCard');
+  if (!state.drives.length) { card.hidden = true; return; }
+  card.hidden = false;
+  $('#drivesList').innerHTML = state.drives.map((d) => `
+    <div class="drive">
+      <div>
+        <div class="drive-name">${esc(d.name)} ${d.system ? '<span class="kind kind-sistema">sistema</span>' : ''}</div>
+        <div class="drive-path">${esc(d.path)}</div>
+      </div>
+      <div>
+        <div class="drive-meter"><div class="drive-meter-fill ${d.usedPct >= 90 ? 'full' : ''}" style="width:${d.usedPct}%"></div></div>
+        <div class="drive-stats">${fmtBytes(d.free)} libres de ${fmtBytes(d.total)} · ${d.usedPct}% usado</div>
+      </div>
+      <button class="btn" data-scan-drive="${esc(d.path)}">Analizar disco completo</button>
+    </div>`).join('');
+  $$('[data-scan-drive]').forEach((b) => b.addEventListener('click', () => scanFolder(b.dataset.scanDrive, { mode: 'disk' })));
+}
 
 $('#btnPick').addEventListener('click', async () => scanFolder(await ordena.pickFolder()));
 $('#btnChangeFolder').addEventListener('click', async () => scanFolder(await ordena.pickFolder()));
 $('#btnRescan').addEventListener('click', () => scanFolder(state.root));
 ordena.onMenuOpenFolder(async () => scanFolder(await ordena.pickFolder()));
-ordena.onDevScan((root) => scanFolder(root));
-ordena.onDevView((view) => showView(view));
-ordena.onDevAction((action) => { const b = { organize: '#btnOrganize', cleanup: '#btnCleanup', dupes: '#btnDupes' }[action]; if (b) $(b).click(); });
+ordena.onDevScan((p) => scanFolder(p.root, { mode: p.mode, confirmed: true }));
+ordena.onDevView((view) => { showView(view); if (view === 'disk' && !state.diskLevel && state.summary) loadDisk(''); });
+ordena.onDevAction((action) => { const b = { organize: '#btnOrganize', cleanup: '#btnCleanup', dupes: '#btnDupes', explain: '#btnExplain' }[action]; if (b) $(b).click(); });
 
 async function renderQuickFolders() {
   const folders = await ordena.commonFolders();
-  const labels = { downloads: 'Descargas', desktop: 'Escritorio', documents: 'Documentos', pictures: 'Imágenes', videos: 'Videos', music: 'Música' };
+  const labels = { home: 'Carpeta de usuario', downloads: 'Descargas', desktop: 'Escritorio', documents: 'Documentos', pictures: 'Imágenes', videos: 'Videos', music: 'Música' };
   $('#quickFolders').innerHTML = Object.entries(folders)
     .filter(([, p]) => p)
     .map(([k, p]) => `<button class="quick-folder" data-path="${esc(p)}"><strong>${labels[k]}</strong><span>${esc(p)}</span></button>`)
@@ -241,7 +293,7 @@ function renderAnalysis(errors = []) {
   const s = state.summary;
   if (!s) return;
   const tiles = [
-    { label: 'Archivos', value: fmtInt(s.totalFiles), sub: `${fmtInt(s.totalDirs - 1)} subcarpetas` },
+    { label: 'Archivos', value: fmtInt(s.totalFiles), sub: `${fmtInt(s.totalDirs - 1)} carpetas${s.mode === 'disk' ? ` · detalle de ${fmtInt(s.storedFiles)} de ≥ 1 MB` : ''}` },
     { label: 'Espacio total', value: fmtBytes(s.totalSize) },
     { label: 'Sueltos en la raíz', value: fmtInt(s.rootFiles), sub: 'candidatos a organizar' },
     { label: 'Temporales / basura', value: fmtBytes(s.junkBytes), sub: `${fmtInt(s.junk.length)} archivos` },
@@ -254,6 +306,12 @@ function renderAnalysis(errors = []) {
   $('#categoryBars').innerHTML = barsHtml(s.categories.slice(0, 10).map((c) => ({ label: c.category, value: c.bytes, sub: `${fmtInt(c.count)} archivos` })), s.totalSize) || '<div class="empty">Sin archivos</div>';
   $('#ageBars').innerHTML = barsHtml(Object.entries(s.ageBuckets).map(([k, v]) => ({ label: k, value: v })), s.totalSize);
   $('#extChips').innerHTML = s.extensions.slice(0, 14).map((e) => `<span class="chip"><strong>.${esc(e.ext)}</strong> ${fmtBytes(e.bytes)} · ${fmtInt(e.count)}</span>`).join('');
+
+  const topDirsCard = $('#topDirsCard');
+  if (s.topDirs && s.topDirs.length) {
+    topDirsCard.hidden = false;
+    $('#topDirsBars').innerHTML = barsHtml(s.topDirs.slice(0, 12).map((d) => ({ label: d.name, value: d.size, sub: `${fmtInt(d.fileCount)} archivos` })), s.totalSize);
+  } else topDirsCard.hidden = true;
 
   $('#largestTable tbody').innerHTML = s.largest.slice(0, 20).map((f) => `
     <tr>
@@ -313,6 +371,217 @@ ordena.onDupesProgress((p) => {
   } else {
     $('#cleanupProgressText').textContent = 'MiniMax está evaluando qué se puede eliminar…';
   }
+});
+
+
+// ---------- disk explorer ----------
+
+function kindBadge(kind) {
+  return `<span class="kind kind-${esc(kind)}">${esc(kind)}</span>`;
+}
+
+function hintHtml(e) {
+  const ex = state.explanations.get(e.rel);
+  if (ex) {
+    return `<div class="explain">${esc(ex.what)}${ex.how ? `<div class="how">${esc(ex.how)}</div>` : ''}
+      <div class="flags"><span class="flag flag-${ex.delete}">borrar: ${ex.delete}</span><span class="flag flag-${ex.move}">mover a otro disco: ${ex.move}</span><span class="flag">riesgo ${esc(ex.risk)}</span></div></div>`;
+  }
+  if (e.hint) return `<div class="hint">${esc(e.hint.what)} <span class="how">· ${esc(e.hint.how)}</span></div>`;
+  return '';
+}
+
+function actionsHtml(e) {
+  const canAct = !e.protected;
+  return `<div class="row-actions">
+    <button class="btn btn-ghost btn-sm" data-reveal="${esc(e.rel)}" title="Mostrar en ${navigator.platform.includes('Mac') ? 'Finder' : 'el Explorador'}">Mostrar</button>
+    ${canAct ? `<button class="btn btn-ghost btn-sm" data-relocate="${esc(e.rel)}" title="Copiar a otro disco, borrar aquí y dejar un enlace">Mover a otro disco…</button>` : ''}
+    ${canAct ? `<button class="btn btn-ghost btn-sm" data-trash-path="${esc(e.rel)}">Papelera</button>` : '<span class="kind kind-sistema" title="Protegida por Ordena">protegida</span>'}
+  </div>`;
+}
+
+async function loadDisk(rel) {
+  try {
+    const level = await ordena.children(rel);
+    state.diskRel = level.rel;
+    state.diskLevel = level;
+    renderDisk();
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+function renderDisk() {
+  const level = state.diskLevel;
+  if (!level) return;
+  const s = state.summary;
+  $('#diskCrumbs').innerHTML = [`<button class="crumb ${level.rel === '' ? 'current' : ''}" data-crumb="">${esc(state.root)}</button>`,
+    ...level.crumbs.map((c, i) => `<span>/</span><button class="crumb ${i === level.crumbs.length - 1 ? 'current' : ''}" data-crumb="${esc(c.rel)}">${esc(c.name)}</button>`)].join('');
+  $$('[data-crumb]').forEach((b) => b.addEventListener('click', () => loadDisk(b.dataset.crumb)));
+  $('#btnDiskUp').disabled = level.rel === '';
+
+  const pct = s && s.totalSize ? Math.round((level.size / s.totalSize) * 100) : 100;
+  $('#diskTiles').innerHTML = [
+    { label: 'Esta carpeta', value: fmtBytes(level.size), sub: `${pct}% de lo analizado` },
+    { label: 'Archivos', value: fmtInt(level.fileCount), sub: `${fmtInt(level.directFiles)} directamente aquí` },
+    { label: 'Subcarpetas', value: fmtInt(level.dirs.length) },
+  ].map((t) => `<div class="tile"><div class="tile-label">${t.label}</div><div class="tile-value">${t.value}</div>${t.sub ? `<div class="tile-sub">${t.sub}</div>` : ''}</div>`).join('');
+
+  const max = Math.max(level.size, 1);
+  const sizeCell = (size) => `<div class="size-cell"><span>${fmtBytes(size)}</span><div class="size-bar"><div class="size-bar-fill" style="width:${Math.max(1, (size / max) * 100)}%"></div></div></div>`;
+
+  $('#diskDirsNote').textContent = level.dirs.length ? `· ordenadas por tamaño` : '';
+  $('#diskDirsTable tbody').innerHTML = level.dirs.length ? level.dirs.map((d) => `
+    <tr>
+      <td><button class="dir-link" data-open-dir="${esc(d.rel)}">📁 ${esc(d.name)}</button>${hintHtml(d)}</td>
+      <td>${kindBadge(d.kind)}</td>
+      <td class="num">${sizeCell(d.size)}</td>
+      <td class="num">${fmtInt(d.fileCount)}</td>
+      <td>${actionsHtml(d)}</td>
+    </tr>`).join('') : '<tr><td colspan="5" class="empty">No hay subcarpetas.</td></tr>';
+
+  $('#diskFilesNote').textContent = level.filesPartial ? '· solo archivos de 1 MB o más' : '';
+  $('#diskFilesTable tbody').innerHTML = level.files.length ? level.files.map((f) => `
+    <tr>
+      <td><span class="path">${esc(f.name)}</span>${hintHtml(f)}</td>
+      <td>${kindBadge(f.kind)}</td>
+      <td class="num">${sizeCell(f.size)}</td>
+      <td>${fmtDate(f.mtimeMs)}</td>
+      <td>${actionsHtml(f)}</td>
+    </tr>`).join('') : `<tr><td colspan="5" class="empty">${level.filesPartial ? 'No hay archivos de 1 MB o más directamente en esta carpeta.' : 'No hay archivos directamente en esta carpeta.'}</td></tr>`;
+
+  $$('[data-open-dir]').forEach((b) => b.addEventListener('click', () => loadDisk(b.dataset.openDir)));
+  $$('[data-relocate]').forEach((b) => b.addEventListener('click', () => relocateDialog(b.dataset.relocate)));
+  $$('[data-trash-path]').forEach((b) => b.addEventListener('click', () => trashPathDialog(b.dataset.trashPath)));
+}
+
+$('#btnDiskUp').addEventListener('click', () => {
+  const rel = state.diskRel;
+  loadDisk(rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : '');
+});
+
+$('#btnExplain').addEventListener('click', async () => {
+  if (!state.settings?.hasApiKey) { showView('settings'); toast('Configura primero tu clave de MiniMax', 'error'); return; }
+  const level = state.diskLevel;
+  if (!level) return;
+  const rels = [...level.dirs.slice(0, 25), ...level.files.slice(0, 10)].map((e) => e.rel).filter(Boolean);
+  if (!rels.length) { toast('No hay nada que explicar en esta carpeta'); return; }
+  $('#explainProgress').hidden = false;
+  $('#btnExplain').disabled = true;
+  try {
+    const res = await ordena.ai.explain(rels);
+    for (const it of res.items) if (it.rel) state.explanations.set(it.rel, it);
+    $('#explainCard').hidden = false;
+    $('#explainSummary').textContent = res.summary;
+    $('#explainPlan').innerHTML = res.plan.map((p) => `<li>${esc(p)}</li>`).join('');
+    renderDisk();
+  } catch (err) {
+    if (err.code !== 'ABORTED') toast(err.message, 'error');
+  } finally {
+    $('#explainProgress').hidden = true;
+    $('#btnExplain').disabled = false;
+  }
+});
+$('#btnExplainClose').addEventListener('click', () => { $('#explainCard').hidden = true; });
+
+function entryByRel(rel) {
+  const l = state.diskLevel;
+  return l ? [...l.dirs, ...l.files].find((e) => e.rel === rel) : null;
+}
+
+async function relocateDialog(rel) {
+  const e = entryByRel(rel);
+  if (!e) return;
+  try { state.drives = await ordena.drives(); } catch { /* keep */ }
+  const rootLower = String(state.root).toLowerCase();
+  const others = state.drives.filter((d) => !rootLower.startsWith(d.path.toLowerCase()) || d.path === '/');
+  const options = others.map((d, i) => `
+    <label class="dest-option"><input type="radio" name="dest" value="${esc(d.path)}" ${i === 0 ? 'checked' : ''} />
+      <div class="grow"><strong>${esc(d.name)}</strong> <span class="small">${esc(d.path)}</span><div class="small">${fmtBytes(d.free)} libres${d.free < e.size ? ' · <span class="warn-text">no cabe</span>' : ''}</div></div></label>`).join('');
+  const body = `
+    <p>Se copiará <strong>${esc(e.name)}</strong> (${fmtBytes(e.size)}${e.isDir ? `, ${fmtInt(e.fileCount)} archivos` : ''}) al destino, se comprobará la copia y después se eliminará de aquí.</p>
+    ${e.hint && e.hint.move === 'no' ? `<p class="warn-text">Aviso: ${esc(e.hint.what)} ${esc(e.hint.how)}</p>` : ''}
+    ${e.hint && e.hint.move === 'sí' && e.hint.how ? `<p class="small muted">Recomendación: ${esc(e.hint.how)}</p>` : ''}
+    <div id="destOptions">${options || '<p class="small muted">No se detectaron otros discos. Elige una carpeta de destino manualmente.</p>'}
+      <label class="dest-option"><input type="radio" name="dest" value="__custom" ${options ? '' : 'checked'} /><div class="grow"><strong>Otra carpeta…</strong> <span class="small" id="customDest">sin elegir</span></div><button type="button" class="btn btn-sm" id="btnPickDest">Elegir</button></label>
+    </div>
+    ${e.isDir ? '<label class="check mt-s"><input type="checkbox" id="leaveLink" checked /> Dejar un enlace en la ubicación original para que los programas sigan encontrando la carpeta</label>' : ''}
+    <p class="small muted mt-s">Podrás deshacerlo desde Historial mientras no borres la copia.</p>`;
+  let customPath = '';
+  const promise = confirmDialog({ title: 'Mover a otro disco', bodyHtml: body, okText: 'Mover' });
+  $('#btnPickDest').addEventListener('click', async () => {
+    const p = await ordena.pickDestination();
+    if (p) { customPath = p; $('#customDest').textContent = p; $('input[name="dest"][value="__custom"]').checked = true; }
+  });
+  const selected = () => $('input[name="dest"]:checked')?.value;
+  const leaveLinkEl = () => $('#leaveLink');
+  const ok = await promise;
+  if (!ok) return;
+  let dest = selected();
+  const leaveLink = leaveLinkEl() ? leaveLinkEl().checked : false;
+  if (dest === '__custom') dest = customPath;
+  if (!dest) { toast('Elige una carpeta de destino', 'error'); return; }
+  // Put user folders inside a subfolder named after the source's parent, to keep things tidy on the other disk.
+  if (others.some((d) => d.path === dest)) dest = dest.replace(/[\\/]+$/, '') + (navigator.platform.includes('Win') ? '\\' : '/') + 'Ordena';
+  await runRelocate(rel, dest, leaveLink);
+}
+
+async function runRelocate(rel, dest, leaveLink) {
+  const bar = $('#relocateProgress');
+  bar.hidden = false;
+  $('#relocateFill').style.width = '0%';
+  $('#relocateText').textContent = 'Copiando…';
+  setBusy(true);
+  try {
+    const res = await ordena.ops.relocate(rel, dest, { leaveLink });
+    state.summary = res.summary;
+    state.duplicates = null;
+    state.explanations.delete(rel);
+    renderAnalysis();
+    await loadDisk(state.diskRel);
+    toast(`Movido a ${res.dest} (${fmtBytes(res.bytes)})${res.linked ? ' · enlace creado' : ''}`, 'ok');
+  } catch (err) {
+    toast(err.message, 'error');
+  } finally {
+    bar.hidden = true;
+    setBusy(false);
+  }
+}
+
+async function trashPathDialog(rel) {
+  const e = entryByRel(rel);
+  if (!e) return;
+  const ok = await confirmDialog({
+    title: `¿Enviar "${e.name}" a la Papelera?`,
+    bodyHtml: `<p>${e.isDir ? `La carpeta completa (${fmtInt(e.fileCount)} archivos, ${fmtBytes(e.size)})` : `El archivo (${fmtBytes(e.size)})`} irá a la Papelera del sistema; podrás recuperarlo desde allí.</p>` +
+      (e.hint && e.hint.del === 'no' ? `<p class="warn-text">Aviso: ${esc(e.hint.what)} No se recomienda borrarla.</p>` : '') +
+      (e.hint && e.hint.del === 'parcial' ? `<p class="warn-text">Aviso: solo parte de su contenido es prescindible. ${esc(e.hint.how)}</p>` : ''),
+    okText: 'Enviar a la Papelera',
+    danger: true,
+  });
+  if (!ok) return;
+  setBusy(true);
+  try {
+    const res = await ordena.ops.trashPath(rel);
+    state.summary = res.summary;
+    state.duplicates = null;
+    renderAnalysis();
+    await loadDisk(state.diskRel);
+    toast(`Liberados ${fmtBytes(res.bytes)} (en la Papelera)`, 'ok');
+  } catch (err) {
+    toast(err.message, 'error');
+  } finally {
+    setBusy(false);
+  }
+}
+
+ordena.onOpsProgress((p) => {
+  if (p.kind !== 'relocate') return;
+  const bar = $('#relocateProgress');
+  bar.hidden = false;
+  const pct = p.totalBytes ? Math.round((p.bytes / p.totalBytes) * 100) : Math.round((p.current / p.total) * 100);
+  $('#relocateFill').style.width = `${pct}%`;
+  $('#relocatePct').textContent = `${pct}%`;
+  $('#relocateText').textContent = `Copiando ${p.current}/${p.total} · ${p.file || ''}`;
 });
 
 // ---------- organize ----------
@@ -613,20 +882,21 @@ async function loadHistory() {
     list.innerHTML = entries.map((e) => `
       <div class="card history-item ${e.undone ? 'undone' : ''}">
         <div>
-          <div><strong>${e.type === 'move' ? `Movidos ${e.count} archivos` : `Enviados ${e.count} archivos a la Papelera${e.bytes ? ` (${fmtBytes(e.bytes)})` : ''}`}</strong>${e.undone ? ' <span class="badge badge-neutral">deshecho</span>' : ''}</div>
+          <div><strong>${e.type === 'move' ? `Movidos ${e.count} archivos` : e.type === 'relocate' ? `Trasladado a otro disco: ${esc(e.src.split(/[\\/]/).pop())} (${fmtBytes(e.bytes)})` : `Enviados ${e.count} archivos a la Papelera${e.bytes ? ` (${fmtBytes(e.bytes)})` : ''}`}</strong>${e.undone ? ' <span class="badge badge-neutral">deshecho</span>' : ''}</div>
           <div class="meta">${new Date(e.at).toLocaleString('es')} · <span class="path">${esc(e.root)}</span></div>
           <details><summary>Ver detalle</summary><ul>${e.entries.slice(0, 200).map((x) => `<li>${esc(x.from ?? x.path)}${x.to ? ` → ${esc(x.to)}` : ''}</li>`).join('')}</ul></details>
         </div>
-        ${e.type === 'move' && !e.undone ? `<button class="btn" data-undo="${e.id}">Deshacer</button>` : ''}
+        ${(e.type === 'move' || e.type === 'relocate') && !e.undone ? `<button class="btn" data-undo="${e.id}">Deshacer</button>` : ''}
       </div>`).join('');
     $$('[data-undo]').forEach((b) => b.addEventListener('click', async () => {
-      const ok = await confirmDialog({ title: '¿Deshacer estos movimientos?', bodyHtml: '<p>Los archivos volverán a su ubicación anterior y se eliminarán las carpetas que quedaron vacías.</p>', okText: 'Deshacer' });
+      const ok = await confirmDialog({ title: '¿Deshacer esta operación?', bodyHtml: '<p>Los archivos volverán a su ubicación anterior. Si fue un traslado a otro disco, se copiarán de vuelta y se borrará la copia.</p>', okText: 'Deshacer' });
       if (!ok) return;
       b.disabled = true;
       try {
         const res = await ordena.ops.undo(b.dataset.undo);
         if (res.summary) { state.summary = res.summary; state.duplicates = null; state.organizePlan = null; renderAnalysis(); renderDuplicates(); renderOrganizePlan(); }
-        toast(res.failed.length ? `${res.restored.length} restaurados, ${res.failed.length} fallaron` : `${res.restored.length} archivos restaurados ✓`, res.failed.length ? 'error' : 'ok');
+        if (res.needsRescan) toast('Restaurado. Pulsa "Reanalizar" para actualizar los tamaños.', 'ok');
+        else toast(res.failed.length ? `${res.restored.length} restaurados, ${res.failed.length} fallaron` : `${res.restored.length} archivos restaurados ✓`, res.failed.length ? 'error' : 'ok');
         loadHistory();
       } catch (err) {
         toast(err.message, 'error');
@@ -642,7 +912,7 @@ $('#btnOpenTrash').addEventListener('click', () => ordena.shell.openTrash().catc
 
 // ---------- ops progress ----------
 ordena.onOpsProgress((p) => {
-  if (p.total > 20) toast(`Procesando ${p.current}/${p.total}…`);
+  if (p.kind !== 'relocate' && p.total > 20) toast(`Procesando ${p.current}/${p.total}…`);
 });
 
 // ---------- init ----------
@@ -654,5 +924,6 @@ ordena.onOpsProgress((p) => {
   $('#appInfo').textContent = `Ordena ${info.version} · ${info.platform} · datos en ${info.userData}`;
   await refreshSettings();
   await renderQuickFolders();
+  await renderDrives();
   updateNavAvailability();
 })();

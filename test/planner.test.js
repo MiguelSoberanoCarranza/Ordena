@@ -26,8 +26,10 @@ const scan = {
     file('Docs/factura-2024.pdf', 60),
     file('node_modules/x/y.js', 10),
   ],
-  dirs: [{ rel: '', empty: false }, { rel: 'Proyectos', empty: false }, { rel: 'Proyectos/app', empty: false }, { rel: 'Docs', empty: false }, { rel: 'node_modules', empty: false }, { rel: 'node_modules/x', empty: false }, { rel: 'vacia', empty: true }],
+  dirs: [{ rel: '', empty: false, depth: 0, directFiles: 4 }, { rel: 'Proyectos', empty: false, depth: 1 }, { rel: 'Proyectos/app', empty: false, depth: 2 }, { rel: 'Docs', empty: false, depth: 1 }, { rel: 'node_modules', empty: false, depth: 1 }, { rel: 'node_modules/x', empty: false, depth: 2 }, { rel: 'vacia', empty: true, depth: 1 }],
 };
+scan.totalFiles = scan.files.length;
+scan.stats = { categories: [], extensions: [], largest: [...scan.files].sort((a, b) => b.size - a.size), junk: [], junkBytes: 0, junkCount: 0 };
 
 test('buildOrganizeMessages lists files and folder summary', () => {
   const msgs = planner.buildOrganizeMessages(summarize(scan), scan.files, { instructions: 'agrupa por año' });
@@ -120,4 +122,22 @@ test('buildChatMessages includes context and trims history', () => {
   const msgs = planner.buildChatMessages(summarize(scan), null, history);
   assert.equal(msgs.length, 21);
   assert.match(msgs[0].content, /aún no analizados/);
+});
+
+test('buildExplainMessages / buildExplainResult', () => {
+  const items = [
+    { path: 'C:\\Windows', size: 30e9, isDir: true, fileCount: 100000, kind: 'sistema', hint: { what: 'Windows', del: 'no', move: 'no' } },
+    { path: 'C:\\Users\\m\\Videos', size: 80e9, isDir: true, fileCount: 300, kind: 'usuario', hint: null },
+  ];
+  const msgs = planner.buildExplainMessages('C:\\', items, { platform: 'win32', drives: [{ name: 'D:', path: 'D:\\', free: 5e11, total: 1e12 }] });
+  assert.match(msgs[1].content, /Windows/);
+  assert.match(msgs[1].content, /D:\\/);
+  const res = planner.buildExplainResult({ summary: 's', items: [
+    { path: 'C:\\Users\\m\\Videos', what: 'Tus vídeos', delete: 'parcial', move: 'Si', how: 'Propiedades → Ubicación', risk: 'bajo' },
+    { path: 'C:\\otra', what: 'inventada', delete: 'sí', move: 'sí' },
+  ], plan: ['Mover Vídeos a D:'] }, items);
+  assert.equal(res.items.length, 1);
+  assert.equal(res.items[0].move, 'sí');
+  assert.equal(res.items[0].delete, 'parcial');
+  assert.deepEqual(res.plan, ['Mover Vídeos a D:']);
 });

@@ -121,12 +121,66 @@ function buildChatMessages(summary, duplicates, history) {
     ? `${describeFolder(summary)}\n\nArchivos más grandes:\n${summary.largest.slice(0, 20).map(fileLine).join('\n')}\n\n` +
       `Temporales detectados: ${summary.junk.length} (${formatBytes(summary.junkBytes)}). Carpetas vacías: ${summary.emptyDirs.length}. ` +
       `Duplicados: ${duplicates ? `${duplicates.groups.length} grupos, ${formatBytes(duplicates.wastedBytes)} recuperables` : 'aún no analizados'}.\n` +
-      `Espacio por antigüedad: ${Object.entries(summary.ageBuckets).map(([k, v]) => `${k}: ${formatBytes(v)}`).join(', ')}.`
+      `Espacio por antigüedad: ${Object.entries(summary.ageBuckets).map(([k, v]) => `${k}: ${formatBytes(v)}`).join(', ')}.\n` +
+      (summary.topDirs?.length ? `Subcarpetas que más ocupan: ${summary.topDirs.slice(0, 15).map((d) => `${d.name} ${formatBytes(d.size)}`).join(', ')}.` : '')
     : 'Todavía no se ha analizado ninguna carpeta.';
   return [
     { role: 'system', content: `${CHAT_SYSTEM}\n\nContexto del análisis actual:\n${context}` },
     ...history.slice(-20).map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: String(m.content).slice(0, 4000) })),
   ];
+}
+
+const EXPLAIN_SYSTEM = `Eres "Ordena", un experto en administración de Windows y macOS que explica a un usuario no técnico qué ocupa espacio en su disco.
+Recibes una lista de carpetas o archivos con su tamaño y, cuando la hay, una pista de la base de conocimiento de la app.
+Responde ÚNICAMENTE con un objeto JSON válido con esta forma:
+{
+  "summary": "2-4 frases: qué es lo que más pesa y cuál sería la estrategia más efectiva para liberar espacio en este disco",
+  "items": [{"path": "ruta tal como aparece", "what": "qué es, en una frase clara", "delete": "sí|parcial|no", "move": "sí|parcial|no", "how": "cómo reducirlo o moverlo a otro disco, con pasos concretos (menús, comandos)", "risk": "bajo|medio|alto"}],
+  "plan": ["paso 1 concreto y ordenado por impacto", "paso 2", "..."]
+}
+Reglas:
+- Usa las rutas EXACTAS que se te dan. Cubre todos los elementos de la lista.
+- "delete" = si se puede borrar sin romper nada (parcial = solo parte de su contenido). "move" = si se puede llevar a otro disco (mediante la opción nativa del programa, cambiando su ubicación, o moviéndola y dejando un enlace/junction).
+- Sé honesto: carpetas del sistema (Windows, Program Files, System, Library del sistema) NO se mueven; di cómo reducirlas si se puede.
+- Para carpetas de usuario (Documentos, Vídeos, Descargas, bibliotecas de juegos, máquinas virtuales, Docker, fototecas, copias de seguridad) explica cómo moverlas a otro disco correctamente.
+- Habla en español, claro y breve. Nada de markdown fuera del JSON.`;
+
+function buildExplainMessages(rootAbs, items, { platform = process.platform, drives = [] } = {}) {
+  const osName = platform === 'win32' ? 'Windows' : platform === 'darwin' ? 'macOS' : 'Linux';
+  const lines = items.map((it) => {
+    const hint = it.hint ? ` | pista: ${it.hint.what} (borrar: ${it.hint.del}, mover: ${it.hint.move})` : '';
+    return `${it.path}\t${formatBytes(it.size)}\t${it.isDir ? `carpeta, ${it.fileCount} archivos` : 'archivo'}\t${it.kind}${hint}`;
+  }).join('\n');
+  const driveText = drives.length ? `Discos del equipo: ${drives.map((d) => `${d.name} (${d.path}) ${formatBytes(d.free)} libres de ${formatBytes(d.total)}`).join('; ')}.` : '';
+  const user = `Sistema: ${osName}. Carpeta analizada: ${rootAbs}.\n${driveText}\n\nElementos (ruta\ttamaño\ttipo\tclase | pista):\n${lines}\n\nGenera el JSON.`;
+  return [
+    { role: 'system', content: EXPLAIN_SYSTEM },
+    { role: 'user', content: user },
+  ];
+}
+
+function buildExplainResult(aiJson, items) {
+  const allowed = new Set(items.map((i) => i.path));
+  const norm = (v, ok, def) => (ok.includes(String(v || '').toLowerCase()) ? String(v).toLowerCase() : def);
+  const seen = new Set();
+  const out = [];
+  for (const it of Array.isArray(aiJson?.items) ? aiJson.items : []) {
+    if (!it || typeof it.path !== 'string' || !allowed.has(it.path) || seen.has(it.path)) continue;
+    seen.add(it.path);
+    out.push({
+      path: it.path,
+      what: String(it.what || ''),
+      delete: norm(it.delete, ['sí', 'si', 'parcial', 'no'], 'no').replace('si', 'sí'),
+      move: norm(it.move, ['sí', 'si', 'parcial', 'no'], 'no').replace('si', 'sí'),
+      how: String(it.how || ''),
+      risk: norm(it.risk, ['bajo', 'medio', 'alto'], 'medio'),
+    });
+  }
+  return {
+    summary: String(aiJson?.summary || ''),
+    items: out,
+    plan: (Array.isArray(aiJson?.plan) ? aiJson.plan : []).map(String).slice(0, 12),
+  };
 }
 
 function compileRule(rule) {
@@ -150,7 +204,7 @@ function compileRule(rule) {
  * @returns {{summary:string, folders:Array, moves:Array<{from:string,to:string,reason:string,source:'ai'|'rule',size:number}>, rejected:Array}}
  */
 function buildOrganizePlan(aiJson, scan, { applyRulesToSubfolders = false, now = Date.now() } = {}) {
-  const byRel = new Map(scan.files.map((f) => [f.rel, f]));
+  const byRel = fileLookup(scan);
   const existingDirs = new Set(scan.dirs.map((d) => d.rel));
   const moves = [];
   const rejected = [];
@@ -222,8 +276,14 @@ function buildOrganizePlan(aiJson, scan, { applyRulesToSubfolders = false, now =
   };
 }
 
+function fileLookup(scan) {
+  const byRel = new Map();
+  for (const f of [...(scan.stats?.largest || []), ...(scan.stats?.junk || []), ...scan.files]) byRel.set(f.rel, f);
+  return byRel;
+}
+
 function buildCleanupPlan(aiJson, scan, duplicates) {
-  const byRel = new Map(scan.files.map((f) => [f.rel, f]));
+  const byRel = fileLookup(scan);
   const seen = new Set();
   const suggestions = [];
   const rejected = [];
@@ -273,6 +333,8 @@ function buildCleanupPlan(aiJson, scan, duplicates) {
 }
 
 module.exports = {
+  buildExplainMessages,
+  buildExplainResult,
   buildOrganizeMessages,
   buildCleanupMessages,
   buildChatMessages,

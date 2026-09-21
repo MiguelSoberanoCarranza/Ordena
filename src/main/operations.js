@@ -1,5 +1,6 @@
 'use strict';
 
+const fs = require('fs');
 const fsp = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');
@@ -190,3 +191,133 @@ async function removeEmptyDirs(root, rels) {
 }
 
 module.exports = { Journal, applyMoves, undoMoves, trashFiles, removeEmptyDirs, uniqueDestination };
+
+// ---------------------------------------------------------------------------
+// Relocate a folder or file to another disk (copy → verify → delete → optional link back).
+// ---------------------------------------------------------------------------
+
+async function walkFiles(abs, list) {
+  const entries = await fsp.readdir(abs, { withFileTypes: true });
+  for (const e of entries) {
+    const p = path.join(abs, e.name);
+    if (e.isSymbolicLink()) { list.push({ abs: p, link: true }); continue; }
+    if (e.isDirectory()) await walkFiles(p, list);
+    else if (e.isFile()) list.push({ abs: p, size: (await fsp.stat(p)).size });
+  }
+  return list;
+}
+
+/**
+ * Move `srcAbs` (file or directory) into `destDirAbs` (a folder on another disk).
+ * Source is only deleted after every file was copied and its size verified.
+ * @param {object} o
+ * @param {boolean} [o.leaveLink]  leave a symlink/junction at the old location pointing to the new one
+ * @param {(p:{current:number,total:number,bytes:number,totalBytes:number,file:string})=>void} [o.onProgress]
+ */
+async function relocate(srcAbs, destDirAbs, { leaveLink = true, journal, onProgress, isProtected } = {}) {
+  srcAbs = path.resolve(srcAbs);
+  destDirAbs = path.resolve(destDirAbs);
+  if (isProtected && isProtected(srcAbs)) throw new Error('Esta carpeta es del sistema y no se puede mover.');
+  const rel = path.relative(srcAbs, destDirAbs);
+  if (rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))) throw new Error('El destino no puede estar dentro del origen.');
+  const srcStat = await fsp.lstat(srcAbs);
+  if (srcStat.isSymbolicLink()) throw new Error('El origen ya es un enlace; no hay nada que mover.');
+  const destAbs = await uniqueDestination(path.join(destDirAbs, path.basename(srcAbs)));
+  await fsp.mkdir(destDirAbs, { recursive: true });
+
+  const isDir = srcStat.isDirectory();
+  const items = isDir ? await walkFiles(srcAbs, []) : [{ abs: srcAbs, size: srcStat.size }];
+  const totalBytes = items.reduce((s, i) => s + (i.size || 0), 0);
+  let bytes = 0;
+  const failed = [];
+
+  for (let i = 0; i < items.length; i += 1) {
+    const it = items[i];
+    const target = isDir ? path.join(destAbs, path.relative(srcAbs, it.abs)) : destAbs;
+    try {
+      await fsp.mkdir(path.dirname(target), { recursive: true });
+      if (it.link) {
+        const linkTarget = await fsp.readlink(it.abs);
+        await fsp.symlink(linkTarget, target).catch(() => {});
+      } else {
+        await fsp.copyFile(it.abs, target, fs.constants.COPYFILE_EXCL);
+        const st = await fsp.stat(target);
+        if (st.size !== it.size) throw new Error('tamaño distinto tras copiar');
+        try { const s = await fsp.stat(it.abs); await fsp.utimes(target, s.atime, s.mtime); } catch { /* ignore */ }
+        bytes += it.size;
+      }
+    } catch (err) {
+      failed.push({ path: it.abs, error: err.message });
+    }
+    if (onProgress) onProgress({ current: i + 1, total: items.length, bytes, totalBytes, file: path.basename(it.abs) });
+  }
+
+  if (failed.length > 0) {
+    // Leave the source untouched; remove the partial copy so the user can retry.
+    await fsp.rm(destAbs, { recursive: true, force: true }).catch(() => {});
+    const err = new Error(`No se pudieron copiar ${failed.length} archivos (p. ej. ${path.basename(failed[0].path)}: ${failed[0].error}). El original no se ha tocado.`);
+    err.failed = failed;
+    throw err;
+  }
+
+  // Copy verified: remove source, then link back.
+  await fsp.rm(srcAbs, { recursive: true, force: true });
+  let linked = false;
+  if (leaveLink && isDir) {
+    try {
+      await fsp.symlink(destAbs, srcAbs, process.platform === 'win32' ? 'junction' : 'dir');
+      linked = true;
+    } catch { linked = false; }
+  }
+  const entry = {
+    id: crypto.randomUUID(),
+    type: 'relocate',
+    root: path.dirname(srcAbs),
+    at: new Date().toISOString(),
+    count: items.length,
+    bytes,
+    src: srcAbs,
+    dest: destAbs,
+    linked,
+    entries: [{ from: srcAbs, to: destAbs }],
+    undone: false,
+  };
+  if (journal) await journal.append(entry);
+  return { journalId: entry.id, src: srcAbs, dest: destAbs, bytes, files: items.length, linked };
+}
+
+/** Undo a relocation: remove the link, copy everything back, delete the copy on the other disk. */
+async function undoRelocate(entry, { journal, onProgress } = {}) {
+  const { src, dest } = entry;
+  try {
+    const lst = await fsp.lstat(src);
+    if (lst.isSymbolicLink()) {
+      await fsp.unlink(src).catch(() => fsp.rmdir(src));
+    } else {
+      throw new Error('La ubicación original ya está ocupada por otra cosa.');
+    }
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+  }
+  const res = await relocate(dest, path.dirname(src), { leaveLink: false, onProgress });
+  if (path.resolve(res.dest) !== path.resolve(src)) {
+    // uniqueDestination renamed it (should not happen after removing the link) — rename back if possible
+    try { await fsp.rename(res.dest, src); } catch { /* keep */ }
+  }
+  if (journal) await journal.update(entry.id, { undone: true, undoneAt: new Date().toISOString() });
+  return { restored: src, bytes: res.bytes };
+}
+
+async function trashPathAbs(abs, { trashImpl, isProtected, journal } = {}) {
+  if (isProtected && isProtected(abs)) throw new Error('Esta ruta es del sistema y no se puede eliminar.');
+  const st = await fsp.stat(abs);
+  await trashImpl(abs);
+  const entry = { id: crypto.randomUUID(), type: 'trash', root: path.dirname(abs), at: new Date().toISOString(), count: 1, bytes: st.isDirectory() ? 0 : st.size, entries: [{ path: abs }], undone: false };
+  if (journal) await journal.append(entry);
+  return entry;
+}
+
+module.exports.relocate = relocate;
+module.exports.undoRelocate = undoRelocate;
+module.exports.trashPathAbs = trashPathAbs;
+module.exports.walkFiles = walkFiles;

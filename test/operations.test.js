@@ -63,3 +63,36 @@ test('removeEmptyDirs only removes empty directories', async () => {
   assert.equal(res.failed.length, 1);
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+test('relocate copies a folder elsewhere, removes the source, leaves a link and can be undone', async () => {
+  const { relocate, undoRelocate } = require('../src/main/operations');
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ordena-reloc-'));
+  const src = path.join(base, 'Videos');
+  fs.mkdirSync(path.join(src, 'sub'), { recursive: true });
+  fs.writeFileSync(path.join(src, 'a.mp4'), Buffer.alloc(5000, 1));
+  fs.writeFileSync(path.join(src, 'sub', 'b.mp4'), Buffer.alloc(3000, 2));
+  const destDir = path.join(base, 'OtroDisco');
+  const journal = new Journal(path.join(base, 'j.json'));
+  const progress = [];
+
+  await assert.rejects(relocate(src, path.join(src, 'sub'), {}), /dentro del origen/);
+  await assert.rejects(relocate(src, destDir, { isProtected: () => true }), /sistema/);
+
+  const res = await relocate(src, destDir, { journal, leaveLink: true, onProgress: (p) => progress.push(p) });
+  assert.equal(res.dest, path.join(destDir, 'Videos'));
+  assert.equal(res.bytes, 8000);
+  assert.equal(res.files, 2);
+  assert.ok(progress.length >= 2);
+  assert.ok(fs.existsSync(path.join(destDir, 'Videos', 'sub', 'b.mp4')));
+  assert.ok(fs.lstatSync(src).isSymbolicLink());
+  assert.ok(fs.existsSync(path.join(src, 'a.mp4'))); // reachable through the link
+
+  const [entry] = await journal.read();
+  assert.equal(entry.type, 'relocate');
+  await undoRelocate(entry, { journal });
+  assert.ok(!fs.lstatSync(src).isSymbolicLink());
+  assert.ok(fs.existsSync(path.join(src, 'sub', 'b.mp4')));
+  assert.ok(!fs.existsSync(path.join(destDir, 'Videos')));
+  assert.equal((await journal.read())[0].undone, true);
+  fs.rmSync(base, { recursive: true, force: true });
+});
