@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; script-src 'self'" />
+  <title>Ordena</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span class="brand-name">Ordena</span>
+      </div>
+      <nav class="nav" id="nav">
+        <button class="nav-item active" data-view="home"><span class="nav-icon">📁</span>Carpeta</button>
+        <button class="nav-item" data-view="analysis" data-needs-scan><span class="nav-icon">📊</span>Análisis</button>
+        <button class="nav-item" data-view="organize" data-needs-scan><span class="nav-icon">🗂️</span>Organizar</button>
+        <button class="nav-item" data-view="cleanup" data-needs-scan><span class="nav-icon">🧹</span>Liberar espacio</button>
+        <button class="nav-item" data-view="chat" data-needs-scan><span class="nav-icon">💬</span>Preguntar</button>
+        <button class="nav-item" data-view="history"><span class="nav-icon">↩️</span>Historial</button>
+      </nav>
+      <div class="sidebar-footer">
+        <button class="nav-item" data-view="settings"><span class="nav-icon">⚙️</span>Ajustes</button>
+        <div class="version" id="version"></div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div class="folder-pill" id="folderPill" hidden>
+          <span class="folder-pill-label">Carpeta</span>
+          <span class="folder-pill-path" id="folderPath"></span>
+          <button class="btn btn-ghost btn-sm" id="btnRescan" title="Volver a analizar">Reanalizar</button>
+          <button class="btn btn-ghost btn-sm" id="btnChangeFolder">Cambiar</button>
+        </div>
+        <div class="topbar-spacer"></div>
+        <div class="api-badge" id="apiBadge" title="Estado de la API de MiniMax"></div>
+      </header>
+
+      <div class="banner banner-warn" id="apiBanner" hidden>
+        <span>Para usar la IA necesitas una clave de API de MiniMax.</span>
+        <button class="btn btn-sm" data-view="settings">Configurar ahora</button>
+      </div>
+
+      <!-- HOME -->
+      <section class="view active" id="view-home">
+        <div class="hero">
+          <h1>¿Qué carpeta quieres ordenar?</h1>
+          <p class="muted">Ordena analiza tus archivos localmente. Solo se envía a MiniMax una lista con nombres, tamaños y fechas, nunca el contenido de tus archivos.</p>
+          <div class="quick-folders" id="quickFolders"></div>
+          <button class="btn btn-primary btn-lg" id="btnPick">Elegir otra carpeta…</button>
+          <div class="progress" id="scanProgress" hidden>
+            <div class="spinner"></div>
+            <div><strong>Analizando…</strong> <span id="scanProgressText"></span></div>
+          </div>
+        </div>
+        <div class="features">
+          <div class="feature"><h3>📊 Análisis</h3><p>Qué ocupa espacio: por tipo, tamaño y antigüedad. Detecta duplicados y archivos temporales.</p></div>
+          <div class="feature"><h3>🗂️ Organizar con IA</h3><p>MiniMax propone una estructura de carpetas clara. Tú revisas y apruebas cada movimiento. Siempre se puede deshacer.</p></div>
+          <div class="feature"><h3>🧹 Liberar espacio</h3><p>Sugerencias con nivel de confianza. Los archivos van a la Papelera, nunca se borran directamente.</p></div>
+        </div>
+      </section>
+
+      <!-- ANALYSIS -->
+      <section class="view" id="view-analysis">
+        <div class="view-header">
+          <h2>Análisis de la carpeta</h2>
+          <button class="btn" id="btnDupes">Buscar duplicados</button>
+        </div>
+        <div class="tiles" id="tiles"></div>
+        <div class="grid-2">
+          <div class="card">
+            <h3>Espacio por categoría</h3>
+            <div class="bars" id="categoryBars"></div>
+          </div>
+          <div class="card">
+            <h3>Espacio por antigüedad</h3>
+            <div class="bars" id="ageBars"></div>
+            <h3 class="mt">Extensiones que más ocupan</h3>
+            <div class="chips" id="extChips"></div>
+          </div>
+        </div>
+        <div class="card">
+          <h3>Archivos más grandes</h3>
+          <table class="table" id="largestTable"><thead><tr><th>Archivo</th><th>Categoría</th><th>Modificado</th><th class="num">Tamaño</th><th></th></tr></thead><tbody></tbody></table>
+        </div>
+        <div class="card" id="dupesCard" hidden>
+          <h3>Duplicados exactos <span class="muted" id="dupesSummary"></span></h3>
+          <div id="dupesList"></div>
+        </div>
+        <div class="card" id="errorsCard" hidden>
+          <h3>Avisos del análisis</h3>
+          <ul class="small" id="errorsList"></ul>
+        </div>
+      </section>
+
+      <!-- ORGANIZE -->
+      <section class="view" id="view-organize">
+        <div class="view-header">
+          <h2>Organizar con IA</h2>
+        </div>
+        <div class="card">
+          <label class="label" for="organizeInstructions">Instrucciones para la IA (opcional)</label>
+          <textarea id="organizeInstructions" rows="2" placeholder="Ej.: agrupa las facturas por año, deja los instaladores en una sola carpeta, no toques la carpeta Proyectos…"></textarea>
+          <div class="row between mt-s">
+            <label class="check"><input type="checkbox" id="organizeSubfolders" /> Aplicar reglas también a archivos dentro de subcarpetas</label>
+            <div class="row gap">
+              <button class="btn btn-ghost" id="btnOrganizeCancel" hidden>Cancelar</button>
+              <button class="btn btn-primary" id="btnOrganize">✨ Generar plan</button>
+            </div>
+          </div>
+          <div class="progress" id="organizeProgress" hidden><div class="spinner"></div><div>MiniMax está estudiando tu carpeta… puede tardar hasta un minuto.</div></div>
+        </div>
+        <div id="organizeResult" hidden>
+          <div class="card">
+            <p id="organizeSummary" class="lead"></p>
+            <div class="chips" id="organizeFolders"></div>
+            <p class="small muted" id="organizeRejected"></p>
+          </div>
+          <div class="card">
+            <div class="row between">
+              <h3>Movimientos propuestos</h3>
+              <div class="row gap">
+                <button class="btn btn-ghost btn-sm" id="orgSelectAll">Todos</button>
+                <button class="btn btn-ghost btn-sm" id="orgSelectNone">Ninguno</button>
+              </div>
+            </div>
+            <div id="movesList"></div>
+            <div class="actionbar">
+              <span id="movesSelectedText" class="muted"></span>
+              <button class="btn btn-primary" id="btnApplyMoves">Aplicar movimientos</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- CLEANUP -->
+      <section class="view" id="view-cleanup">
+        <div class="view-header">
+          <h2>Liberar espacio</h2>
+        </div>
+        <div class="card">
+          <label class="label" for="cleanupInstructions">Instrucciones para la IA (opcional)</label>
+          <textarea id="cleanupInstructions" rows="2" placeholder="Ej.: sé agresivo con instaladores y archivos comprimidos, conserva todos los PDF…"></textarea>
+          <div class="row between mt-s">
+            <span class="small muted">Primero se buscan duplicados (puede tardar en carpetas grandes). Nada se borra sin tu confirmación.</span>
+            <div class="row gap">
+              <button class="btn btn-ghost" id="btnCleanupCancel" hidden>Cancelar</button>
+              <button class="btn btn-primary" id="btnCleanup">🧹 Analizar con IA</button>
+            </div>
+          </div>
+          <div class="progress" id="cleanupProgress" hidden><div class="spinner"></div><div id="cleanupProgressText">Buscando duplicados…</div></div>
+        </div>
+        <div id="cleanupResult" hidden>
+          <div class="card">
+            <p id="cleanupSummary" class="lead"></p>
+            <ul class="small" id="cleanupTips"></ul>
+          </div>
+          <div class="card">
+            <div class="row between wrap">
+              <h3>Sugerencias</h3>
+              <div class="row gap">
+                <label class="check"><input type="checkbox" class="conf-filter" value="alta" checked /> Confianza alta</label>
+                <label class="check"><input type="checkbox" class="conf-filter" value="media" checked /> Media</label>
+                <label class="check"><input type="checkbox" class="conf-filter" value="baja" /> Baja</label>
+                <button class="btn btn-ghost btn-sm" id="clSelectAll">Marcar visibles</button>
+                <button class="btn btn-ghost btn-sm" id="clSelectNone">Ninguno</button>
+              </div>
+            </div>
+            <table class="table" id="cleanupTable"><thead><tr><th></th><th>Archivo</th><th>Motivo</th><th>Confianza</th><th class="num">Tamaño</th><th></th></tr></thead><tbody></tbody></table>
+            <div class="actionbar">
+              <span id="cleanupSelectedText" class="muted"></span>
+              <button class="btn btn-danger" id="btnTrash">Enviar a la Papelera</button>
+            </div>
+          </div>
+          <div class="card" id="emptyDirsCard" hidden>
+            <div class="row between">
+              <h3>Carpetas vacías <span class="muted" id="emptyDirsCount"></span></h3>
+              <button class="btn" id="btnRemoveEmpty">Eliminar carpetas vacías</button>
+            </div>
+            <div class="chips" id="emptyDirsList"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- CHAT -->
+      <section class="view" id="view-chat">
+        <div class="view-header"><h2>Pregunta sobre tu carpeta</h2><button class="btn btn-ghost btn-sm" id="btnChatClear">Limpiar</button></div>
+        <div class="chat card">
+          <div class="chat-messages" id="chatMessages">
+            <div class="msg msg-assistant">Hola 👋 Pregúntame qué está ocupando espacio, qué archivos llevan más tiempo sin usarse o cómo te conviene organizar la carpeta.</div>
+          </div>
+          <form class="chat-input" id="chatForm">
+            <input type="text" id="chatInput" placeholder="Ej.: ¿qué podría borrar sin riesgo para ganar 5 GB?" autocomplete="off" />
+            <button class="btn btn-primary" type="submit" id="btnChatSend">Enviar</button>
+          </form>
+        </div>
+        <div class="chips" id="chatSuggestions">
+          <button class="chip chip-btn">¿Qué ocupa más espacio?</button>
+          <button class="chip chip-btn">¿Qué archivos llevan más de un año sin tocarse?</button>
+          <button class="chip chip-btn">¿Cómo organizarías esta carpeta en 5 carpetas?</button>
+        </div>
+      </section>
+
+      <!-- HISTORY -->
+      <section class="view" id="view-history">
+        <div class="view-header"><h2>Historial de operaciones</h2><button class="btn btn-ghost btn-sm" id="btnOpenTrash">Abrir Papelera</button></div>
+        <p class="muted">Los movimientos se pueden deshacer desde aquí. Los archivos enviados a la Papelera se recuperan desde la Papelera del sistema.</p>
+        <div id="historyList"></div>
+      </section>
+
+      <!-- SETTINGS -->
+      <section class="view" id="view-settings">
+        <div class="view-header"><h2>Ajustes</h2></div>
+        <div class="card">
+          <h3>MiniMax</h3>
+          <label class="label" for="apiKey">Clave de API</label>
+          <div class="row gap">
+            <input type="password" id="apiKey" placeholder="Pega aquí tu clave de MiniMax" autocomplete="off" spellcheck="false" />
+            <button class="btn btn-ghost" id="btnToggleKey" type="button">Mostrar</button>
+          </div>
+          <p class="small muted" id="apiKeyStatus"></p>
+          <p class="small">¿No tienes clave? <a href="#" id="linkGetKey">Créala en platform.minimax.io</a>. Se guarda cifrada en este equipo y solo se usa para llamar a la API.</p>
+          <div class="grid-2 mt">
+            <div>
+              <label class="label" for="model">Modelo</label>
+              <input type="text" id="model" list="modelList" />
+              <datalist id="modelList"></datalist>
+            </div>
+            <div>
+              <label class="label" for="baseUrl">URL base</label>
+              <input type="text" id="baseUrl" placeholder="https://api.minimax.io/v1" />
+              <p class="small muted">Cuenta internacional: <code>https://api.minimax.io/v1</code>. Cuenta de China: <code>https://api.minimaxi.com/v1</code>.</p>
+            </div>
+          </div>
+          <div class="row gap mt">
+            <button class="btn btn-primary" id="btnSaveSettings">Guardar</button>
+            <button class="btn" id="btnTestApi">Probar conexión</button>
+            <span id="settingsStatus" class="small"></span>
+          </div>
+        </div>
+        <div class="card">
+          <h3>Comportamiento</h3>
+          <label class="check"><input type="checkbox" id="settingSubfolders" /> Al organizar, aplicar reglas de la IA también dentro de subcarpetas (por defecto solo a archivos sueltos en la raíz)</label>
+        </div>
+        <div class="card small muted" id="appInfo"></div>
+      </section>
+    </main>
+  </div>
+
+  <div class="modal-backdrop" id="modal" hidden>
+    <div class="modal" role="dialog" aria-modal="true">
+      <h3 id="modalTitle"></h3>
+      <div id="modalBody"></div>
+      <div class="row gap end mt">
+        <button class="btn btn-ghost" id="modalCancel">Cancelar</button>
+        <button class="btn btn-primary" id="modalOk">Confirmar</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast" hidden></div>
+  <script src="app.js"></script>
+</body>
+</html>

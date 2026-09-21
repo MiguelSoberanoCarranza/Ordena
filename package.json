@@ -1,0 +1,24 @@
+{
+  "name": "ordena",
+  "productName": "Ordena",
+  "version": "0.1.0",
+  "description": "Organiza tus archivos y libera espacio en disco con ayuda de la IA de MiniMax.",
+  "main": "src/main/main.js",
+  "author": "Miguel Soberano Carranza",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test \"test/**/*.test.js\"",
+    "lint": "node --check src/main/*.js && node --check src/preload/preload.js && node --check src/renderer/app.js",
+    "icon": "node scripts/make-icon.js",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder",
+    "dist:mac": "electron-builder --mac",
+    "dist:win": "electron-builder --win"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^26.0.0"
+  }
+}

@@ -1,0 +1,66 @@
+appId: com.miguelsoberano.ordena
+productName: Ordena
+copyright: Copyright © 2026 Miguel Soberano Carranza
+directories:
+  output: dist
+  buildResources: build
+files:
+  - src/**/*
+  - package.json
+  - "!**/*.map"
+asar: true
+compression: normal
+publish: null
+
+mac:
+  category: public.app-category.utilities
+  icon: build/icon.png
+  target:
+    - target: dmg
+      arch: [arm64, x64]
+    - target: zip
+      arch: [arm64, x64]
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  darkModeSupport: true
+  # Sin certificado de desarrollador la app se firma "ad-hoc"; el usuario debe abrirla con clic derecho → Abrir la primera vez.
+  identity: null
+  extendInfo:
+    NSDesktopFolderUsageDescription: Ordena necesita acceso al Escritorio para analizar y organizar tus archivos.
+    NSDocumentsFolderUsageDescription: Ordena necesita acceso a Documentos para analizar y organizar tus archivos.
+    NSDownloadsFolderUsageDescription: Ordena necesita acceso a Descargas para analizar y organizar tus archivos.
+    NSRemovableVolumesUsageDescription: Ordena necesita acceso a discos externos para analizar y organizar tus archivos.
+
+dmg:
+  contents:
+    - x: 130
+      y: 220
+    - x: 410
+      y: 220
+      type: link
+      path: /Applications
+
+win:
+  icon: build/icon.png
+  target:
+    - target: nsis
+      arch: [x64, arm64]
+    - target: portable
+      arch: [x64]
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  shortcutName: Ordena
+  language: "3082"
+  installerLanguages: [es_ES, en_US]
+
+portable:
+  artifactName: ${productName}-${version}-portable.${ext}
+
+linux:
+  icon: build/icon.png
+  category: Utility
+  target: [AppImage]
