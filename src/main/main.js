@@ -503,21 +503,28 @@ handle('ops:purge', async (id) => {
   const entries = await journal.read();
   const entry = entries.find((e) => e.id === id);
   if (!entry || entry.type !== 'quarantine') throw new Error('Operación no encontrada');
-  if (entry.purged) return { bytes: 0 };
-  return purgeQuarantine(entry, { journal });
+  if (entry.purged) return { bytes: 0, failed: [], partial: false };
+  state.opsCancel = false;
+  return purgeQuarantine(entry, { journal, shouldCancel: () => state.opsCancel, onProgress: (p) => send('ops:progress', { kind: 'purge', current: p.removed, bytes: p.bytes }) });
 });
 
 handle('ops:purgeAll', async () => {
   const entries = await journal.read();
   let bytes = 0;
   const failed = [];
+  state.opsCancel = false;
+  let done = 0;
   for (const e of entries) {
     if (e.type !== 'quarantine' || e.purged || e.undone) continue;
-    const r = await purgeQuarantine(e, { journal });
+    if (state.opsCancel) break;
+    const base = done;
+    const r = await purgeQuarantine(e, { journal, shouldCancel: () => state.opsCancel, onProgress: (p) => send('ops:progress', { kind: 'purge', current: base + p.removed, bytes: bytes + p.bytes }) });
+    done += r.failed.length ? 0 : (e.count || 0);
     bytes += r.bytes;
     failed.push(...r.failed);
+    if (r.cancelled) break;
   }
-  return { bytes, failed, partial: failed.length > 0 };
+  return { bytes, failed, partial: failed.length > 0, cancelled: state.opsCancel };
 });
 
 handle('ops:revealQuarantine', async (id) => {

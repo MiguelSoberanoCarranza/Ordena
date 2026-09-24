@@ -404,50 +404,62 @@ async function quarantineFiles(root, rels, { quarantineDirFor, trashImpl, journa
  * Delete a file or folder tree, clearing read-only attributes (Windows EPERM) and retrying.
  * Never throws: returns { removed, failed: [{path, error}] }.
  */
-async function rmrf(abs) {
+async function rmrf(abs, { onProgress, shouldCancel } = {}) {
   const failed = [];
   let removed = 0;
-  try {
-    await fsp.rm(abs, { recursive: true, force: true, maxRetries: 2, retryDelay: 100 });
-    return { removed: 1, failed };
-  } catch { /* fall through to the careful walk */ }
+  let bytes = 0;
+  let cancelled = false;
+  let lastReport = 0;
+  const report = (force) => {
+    if (!onProgress) return;
+    const now = Date.now();
+    if (force || now - lastReport > 250) { lastReport = now; onProgress({ removed, bytes }); }
+  };
   async function walk(p) {
+    if (shouldCancel && shouldCancel()) { cancelled = true; return; }
     let st;
     try { st = await fsp.lstat(p); } catch (err) { if (err.code !== 'ENOENT') failed.push({ path: p, error: err.code || err.message }); return; }
     if (st.isDirectory() && !st.isSymbolicLink()) {
-      try { await fsp.chmod(p, 0o777); } catch { /* ignore */ }
       let entries = [];
-      try { entries = await fsp.readdir(p); } catch (err) { failed.push({ path: p, error: err.code || err.message }); return; }
-      for (const name of entries) await walk(path.join(p, name));
-      try { await fsp.rmdir(p); removed += 1; } catch (err) { if (err.code !== 'ENOENT') failed.push({ path: p, error: err.code || err.message }); }
+      try { entries = await fsp.readdir(p); } catch (err) {
+        try { await fsp.chmod(p, 0o777); entries = await fsp.readdir(p); } catch (err2) { failed.push({ path: p, error: err2.code || err2.message }); return; }
+      }
+      for (const name of entries) { await walk(path.join(p, name)); if (cancelled) return; }
+      try { await fsp.rmdir(p); } catch (err) {
+        if (err.code === 'ENOENT') return;
+        try { await fsp.chmod(p, 0o777); await fsp.rmdir(p); } catch (err2) { failed.push({ path: p, error: err2.code || err2.message }); }
+      }
       return;
     }
     try {
       await fsp.unlink(p);
-      removed += 1;
+      removed += 1; bytes += st.size || 0;
     } catch (err) {
       if (err.code === 'ENOENT') return;
       try {
         await fsp.chmod(p, 0o666); // clears the Windows read-only attribute
         await fsp.unlink(p);
-        removed += 1;
+        removed += 1; bytes += st.size || 0;
       } catch (err2) {
         failed.push({ path: p, error: err2.code || err2.message });
       }
     }
+    report(false);
   }
   await walk(abs);
+  report(true);
+  if (cancelled) return { removed, bytes, failed, cancelled: true };
   if (failed.length > 0 && process.platform === 'win32') {
     // Last resort on Windows: clear attributes with the shell and remove the tree.
     try {
       const { execFile } = require('child_process');
-      await new Promise((resolve) => execFile('cmd.exe', ['/d', '/s', '/c', `attrib -R -S -H "${abs}\\*" /S /D & rd /s /q "${abs}"`], { windowsHide: true, timeout: 120000 }, () => resolve()));
+      await new Promise((resolve) => execFile('cmd.exe', ['/d', '/s', '/c', `attrib -R -S -H "${abs}\\*" /S /D & rd /s /q "${abs}"`], { windowsHide: true, timeout: 300000 }, () => resolve()));
       let still = true;
       try { await fsp.lstat(abs); } catch (err) { if (err.code === 'ENOENT') still = false; }
-      if (!still) return { removed: removed + failed.length, failed: [] };
+      if (!still) return { removed: removed + failed.length, bytes, failed: [], cancelled: false };
     } catch { /* keep the failures below */ }
   }
-  return { removed, failed };
+  return { removed, bytes, failed, cancelled: false };
 }
 
 async function dirSize(abs) {
@@ -494,7 +506,7 @@ async function restoreQuarantine(entry, { journal, onProgress } = {}) {
 }
 
 /** Permanently delete the quarantined items of one operation (frees the space). */
-async function purgeQuarantine(entry, { journal } = {}) {
+async function purgeQuarantine(entry, { journal, onProgress, shouldCancel } = {}) {
   let bytes = 0;
   const bases = new Set();
   for (const it of entry.entries) {
@@ -503,15 +515,19 @@ async function purgeQuarantine(entry, { journal } = {}) {
     bytes += it.size || 0;
   }
   const failed = [];
+  let cancelled = false;
+  let removedBytes = 0;
   for (const base of bases) {
-    const r = await rmrf(base);
+    const r = await rmrf(base, { onProgress: onProgress ? (p) => onProgress({ ...p, bytes: removedBytes + p.bytes }) : undefined, shouldCancel });
     failed.push(...r.failed);
+    removedBytes += r.bytes || 0;
+    if (r.cancelled) { cancelled = true; break; }
   }
   if (journal) {
-    if (failed.length === 0) await journal.update(entry.id, { purged: true, purgedAt: new Date().toISOString() });
-    else await journal.update(entry.id, { purgeFailed: failed.length, purgeError: failed[0].error, purgeAttemptAt: new Date().toISOString() });
+    if (!cancelled && failed.length === 0) await journal.update(entry.id, { purged: true, purgedAt: new Date().toISOString() });
+    else await journal.update(entry.id, { purgeFailed: failed.length, purgeError: cancelled ? 'Detenido por el usuario' : failed[0].error, purgeAttemptAt: new Date().toISOString(), bytes: Math.max(0, (entry.bytes || 0) - removedBytes) });
   }
-  return { bytes: failed.length ? 0 : bytes, failed, partial: failed.length > 0 };
+  return { bytes: cancelled || failed.length ? removedBytes : bytes, failed, partial: failed.length > 0, cancelled };
 }
 
 module.exports.quarantineFiles = quarantineFiles;

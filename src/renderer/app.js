@@ -1207,14 +1207,17 @@ async function loadQuarantineStatus() {
 $('#btnPurgeAll').addEventListener('click', async () => {
   const ok = await confirmDialog({ title: '¿Vaciar la cuarentena?', bodyHtml: '<p>Se eliminarán <strong>definitivamente</strong> todos los archivos apartados y se liberará su espacio. Esta acción no se puede deshacer.</p>', okText: 'Vaciar definitivamente', danger: true, ackText: 'He comprobado que todo funciona y no necesito restaurar nada.' });
   if (!ok) return;
+  setBusy(true);
+  $('#btnPurgeAll').disabled = true;
   try {
     const r = await ordena.ops.purgeAll();
     purgeResultToast(r);
     loadHistory();
-  } catch (err) { toast(err.message, 'error'); }
+  } catch (err) { toast(err.message, 'error'); } finally { setBusy(false); $('#btnPurgeAll').disabled = false; }
 });
 
 function purgeResultToast(r) {
+  if (r.cancelled) return toast(`Detenido. Se eliminaron ${fmtBytes(r.bytes || 0)}; el resto sigue en cuarentena.`, 'error');
   if (r.partial) {
     const sample = r.failed[0];
     toast(`${r.failed.length} elemento${r.failed.length === 1 ? '' : 's'} no se pudieron borrar (${sample.error}). Suelen ser archivos de juegos o apps con permisos especiales: ejecuta Ordena como administrador y vuelve a intentarlo, o bórralos desde el Explorador con "Abrir carpeta".`, 'error');
@@ -1265,7 +1268,9 @@ async function loadHistory() {
     $$('[data-purge]').forEach((b) => b.addEventListener('click', async () => {
       const ok = await confirmDialog({ title: '¿Eliminar definitivamente?', bodyHtml: '<p>Se borrarán para siempre los archivos apartados en esta operación y se liberará su espacio.</p>', okText: 'Eliminar definitivamente', danger: true });
       if (!ok) return;
-      try { const r = await ordena.ops.purge(b.dataset.purge); purgeResultToast(r); loadHistory(); } catch (err) { toast(err.message, 'error'); }
+      setBusy(true);
+      $$('#historyList .btn').forEach((x) => { x.disabled = true; });
+      try { const r = await ordena.ops.purge(b.dataset.purge); purgeResultToast(r); } catch (err) { toast(err.message, 'error'); } finally { setBusy(false); loadHistory(); }
     }));
     $$('[data-reveal-q]').forEach((b) => b.addEventListener('click', () => ordena.ops.revealQuarantine(b.dataset.revealQ).catch((err) => toast(err.message, 'error'))));
   } catch (err) {
@@ -1276,12 +1281,21 @@ async function loadHistory() {
 $('#btnOpenTrash').addEventListener('click', () => ordena.shell.openTrash().catch(() => {}));
 
 // ---------- ops progress ----------
-const OPS_LABEL = { trash: 'Enviando a la Papelera', move: 'Moviendo archivos', emptydirs: 'Eliminando carpetas vacías' };
+const OPS_LABEL = { trash: 'Enviando a la Papelera', move: 'Moviendo archivos', emptydirs: 'Eliminando carpetas vacías', purge: 'Eliminando definitivamente', restore: 'Restaurando' };
 let opsBarTimer = null;
 ordena.onOpsProgress((p) => {
   if (p.kind === 'relocate') return;
-  if (!(p.total > 20)) return;
   const bar = $('#opsBar');
+  if (p.kind === 'purge') {
+    bar.hidden = false;
+    $('#opsFill').style.width = '100%';
+    $('#opsFill').style.opacity = '0.4';
+    $('#opsPct').textContent = `${fmtInt(p.current)} archivos · ${fmtBytes(p.bytes || 0)}`;
+    $('#opsText').textContent = 'Eliminando definitivamente… puede tardar varios minutos con juegos grandes';
+    return;
+  }
+  $('#opsFill').style.opacity = '1';
+  if (!(p.total > 20)) return;
   bar.hidden = false;
   const pct = Math.round((p.current / p.total) * 100);
   $('#opsFill').style.width = `${pct}%`;
