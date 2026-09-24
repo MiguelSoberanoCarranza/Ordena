@@ -267,7 +267,13 @@ async function relocate(srcAbs, destDirAbs, { leaveLink = true, journal, onProgr
   }
 
   // Copy verified: remove source, then link back.
-  await fsp.rm(srcAbs, { recursive: true, force: true });
+  const rm = await rmrf(srcAbs);
+  if (rm.failed.length > 0) {
+    const err = new Error(`Se copió todo a ${destAbs}, pero ${rm.failed.length} elementos del origen no se pudieron borrar (${rm.failed[0].error}). Revisa permisos o bórralos a mano; la copia en el destino está completa.`);
+    err.failed = rm.failed;
+    err.dest = destAbs;
+    throw err;
+  }
   let linked = false;
   if (leaveLink && isDir) {
     try {
@@ -394,6 +400,56 @@ async function quarantineFiles(root, rels, { quarantineDirFor, trashImpl, journa
   return { journalId: entry.id, done, failed, bytes, fellBack };
 }
 
+/**
+ * Delete a file or folder tree, clearing read-only attributes (Windows EPERM) and retrying.
+ * Never throws: returns { removed, failed: [{path, error}] }.
+ */
+async function rmrf(abs) {
+  const failed = [];
+  let removed = 0;
+  try {
+    await fsp.rm(abs, { recursive: true, force: true, maxRetries: 2, retryDelay: 100 });
+    return { removed: 1, failed };
+  } catch { /* fall through to the careful walk */ }
+  async function walk(p) {
+    let st;
+    try { st = await fsp.lstat(p); } catch (err) { if (err.code !== 'ENOENT') failed.push({ path: p, error: err.code || err.message }); return; }
+    if (st.isDirectory() && !st.isSymbolicLink()) {
+      try { await fsp.chmod(p, 0o777); } catch { /* ignore */ }
+      let entries = [];
+      try { entries = await fsp.readdir(p); } catch (err) { failed.push({ path: p, error: err.code || err.message }); return; }
+      for (const name of entries) await walk(path.join(p, name));
+      try { await fsp.rmdir(p); removed += 1; } catch (err) { if (err.code !== 'ENOENT') failed.push({ path: p, error: err.code || err.message }); }
+      return;
+    }
+    try {
+      await fsp.unlink(p);
+      removed += 1;
+    } catch (err) {
+      if (err.code === 'ENOENT') return;
+      try {
+        await fsp.chmod(p, 0o666); // clears the Windows read-only attribute
+        await fsp.unlink(p);
+        removed += 1;
+      } catch (err2) {
+        failed.push({ path: p, error: err2.code || err2.message });
+      }
+    }
+  }
+  await walk(abs);
+  if (failed.length > 0 && process.platform === 'win32') {
+    // Last resort on Windows: clear attributes with the shell and remove the tree.
+    try {
+      const { execFile } = require('child_process');
+      await new Promise((resolve) => execFile('cmd.exe', ['/d', '/s', '/c', `attrib -R -S -H "${abs}\\*" /S /D & rd /s /q "${abs}"`], { windowsHide: true, timeout: 120000 }, () => resolve()));
+      let still = true;
+      try { await fsp.lstat(abs); } catch (err) { if (err.code === 'ENOENT') still = false; }
+      if (!still) return { removed: removed + failed.length, failed: [] };
+    } catch { /* keep the failures below */ }
+  }
+  return { removed, failed };
+}
+
 async function dirSize(abs) {
   let total = 0;
   const stack = [abs];
@@ -446,12 +502,20 @@ async function purgeQuarantine(entry, { journal } = {}) {
     bases.add(it.to.slice(0, it.to.indexOf(entry.opId) + entry.opId.length));
     bytes += it.size || 0;
   }
-  for (const base of bases) await fsp.rm(base, { recursive: true, force: true });
-  if (journal) await journal.update(entry.id, { purged: true, purgedAt: new Date().toISOString() });
-  return { bytes };
+  const failed = [];
+  for (const base of bases) {
+    const r = await rmrf(base);
+    failed.push(...r.failed);
+  }
+  if (journal) {
+    if (failed.length === 0) await journal.update(entry.id, { purged: true, purgedAt: new Date().toISOString() });
+    else await journal.update(entry.id, { purgeFailed: failed.length, purgeError: failed[0].error, purgeAttemptAt: new Date().toISOString() });
+  }
+  return { bytes: failed.length ? 0 : bytes, failed, partial: failed.length > 0 };
 }
 
 module.exports.quarantineFiles = quarantineFiles;
 module.exports.restoreQuarantine = restoreQuarantine;
 module.exports.purgeQuarantine = purgeQuarantine;
 module.exports.dirSize = dirSize;
+module.exports.rmrf = rmrf;

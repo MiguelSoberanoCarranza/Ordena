@@ -79,9 +79,15 @@ function classify(abs, platform = process.platform) {
       return { tier: 'usuario', owner: null, note: 'Carpeta dentro de tu perfil.' };
     }
     // Outside Users: game launchers and dev tools at the drive root
-    const games = ['riot games', 'steam', 'steamlibrary', 'steamapps', 'epic games', 'xboxgames', 'games', 'juegos', 'battle.net', 'origin games', 'ea games', 'gog games', 'gog galaxy', 'ubisoft'];
+    if (lower.some((s) => ['windowsapps', 'wpsystem', 'modifiablewindowsapps', 'wumodifiablewindowsapps'].includes(s))) return { tier: 'sistema', owner: 'Xbox / Microsoft Store', note: 'Instalación de apps y juegos de Microsoft Store con permisos especiales. Desinstala desde Configuración → Aplicaciones o la app Xbox.' };
+    const games = ['riot games', 'steam', 'steamlibrary', 'steamapps', 'epic games', 'xboxgames', 'xbox', 'games', 'juegos', 'battle.net', 'origin games', 'ea games', 'ea', 'gog games', 'gog galaxy', 'ubisoft', 'ubisoft game launcher', 'rockstar games', 'bethesda', 'blizzard'];
     const gi = lower.findIndex((s) => games.includes(s));
-    if (gi >= 0) return { tier: 'aplicacion', owner: vendorName(segs[gi + 1] || segs[gi]), note: 'Archivos de un juego o su lanzador. Desinstala o mueve desde el propio lanzador.' };
+    if (gi >= 0) {
+      const launcher = lower[gi] === 'xbox' || lower[gi] === 'xboxgames' ? 'Xbox / Game Pass' : null;
+      const game = segs[gi + 1] ? segs[gi + 1] : segs[gi];
+      return { tier: 'aplicacion', owner: launcher ? `${game} (${launcher})` : vendorName(game), note: launcher ? 'Juego de Xbox / Game Pass. Desinstálalo o muévelo desde la app Xbox; sus archivos tienen permisos especiales.' : 'Archivos de un juego o su lanzador. Desinstala o mueve desde el propio lanzador.' };
+    }
+    if (/microsoft flight simulator|call of duty|forza|halo|minecraft|fortnite|valorant|league of legends|genshin|steamapps/i.test(rel)) return { tier: 'aplicacion', owner: segs.find((s) => /flight simulator|call of duty|forza|halo|minecraft|fortnite|valorant|league of legends|genshin/i.test(s)) || 'Juego', note: 'Archivos de un juego. Desinstálalo desde su lanzador.' };
     const dev = ['vulkansdk', 'python27', 'python311', 'python312', 'python313', 'cygwin64', 'msys64', 'mingw64', 'nvidia', 'intel', 'amd', 'xampp', 'wamp', 'flutter', 'android', 'go', 'ruby', 'perl', 'strawberry', 'nodejs', 'php', 'java', 'jdk', 'octave', 'r', 'sqlite', 'postgresql', 'mysql', 'mongodb'];
     if (dev.includes(lower[0])) return { tier: 'aplicacion', owner: segs[0], note: 'Herramienta instalada en la raíz del disco.' };
     if (cacheHit >= 0) return { tier: 'cache', owner: null, note: 'Caché o temporales.' };

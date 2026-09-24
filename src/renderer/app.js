@@ -1209,15 +1209,22 @@ $('#btnPurgeAll').addEventListener('click', async () => {
   if (!ok) return;
   try {
     const r = await ordena.ops.purgeAll();
-    toast(`Liberados ${fmtBytes(r.bytes)}`, 'ok');
+    purgeResultToast(r);
     loadHistory();
   } catch (err) { toast(err.message, 'error'); }
 });
 
+function purgeResultToast(r) {
+  if (r.partial) {
+    const sample = r.failed[0];
+    toast(`${r.failed.length} elemento${r.failed.length === 1 ? '' : 's'} no se pudieron borrar (${sample.error}). Suelen ser archivos de juegos o apps con permisos especiales: ejecuta Ordena como administrador y vuelve a intentarlo, o bórralos desde el Explorador con "Abrir carpeta".`, 'error');
+  } else toast(`Liberados ${fmtBytes(r.bytes)}`, 'ok');
+}
+
 function historyTitle(e) {
   if (e.type === 'move') return `Movidos ${e.count} archivos`;
   if (e.type === 'relocate') return `Trasladado a otro disco: ${esc(e.src.split(/[\\/]/).pop())} (${fmtBytes(e.bytes)})`;
-  if (e.type === 'quarantine') return `${e.purged ? 'Eliminados definitivamente' : e.undone ? 'Restaurados' : 'En cuarentena'}: ${e.count} elemento${e.count === 1 ? '' : 's'} (${fmtBytes(e.bytes)})${e.fellBack ? ` · ${e.fellBack} fueron a la Papelera del sistema` : ''}`;
+  if (e.type === 'quarantine') return `${e.purged ? 'Eliminados definitivamente' : e.undone ? 'Restaurados' : 'En cuarentena'}: ${e.count} elemento${e.count === 1 ? '' : 's'} (${fmtBytes(e.bytes)})${e.fellBack ? ` · ${e.fellBack} fueron a la Papelera del sistema` : ''}${!e.purged && e.purgeFailed ? ` · <span class="badge badge-baja">${e.purgeFailed} no se pudieron borrar (${esc(e.purgeError || '')})</span>` : ''}`;
   return `Enviados ${e.count} archivos a la Papelera${e.bytes ? ` (${fmtBytes(e.bytes)})` : ''}`;
 }
 
@@ -1236,7 +1243,7 @@ async function loadHistory() {
         </div>
         <div class="row gap">
           ${(e.type === 'move' || e.type === 'relocate') && !e.undone ? `<button class="btn" data-undo="${e.id}">Deshacer</button>` : ''}
-          ${e.type === 'quarantine' && !e.undone && !e.purged ? `<button class="btn btn-primary" data-undo="${e.id}">Restaurar</button><button class="btn btn-ghost" data-purge="${e.id}" title="Eliminar definitivamente y liberar el espacio">Vaciar</button>` : ''}
+          ${e.type === 'quarantine' && !e.undone && !e.purged ? `<button class="btn btn-ghost btn-sm" data-reveal-q="${e.id}" title="Abrir la carpeta de cuarentena en el Explorador">Abrir carpeta</button><button class="btn btn-primary" data-undo="${e.id}">Restaurar</button><button class="btn btn-ghost" data-purge="${e.id}" title="Eliminar definitivamente y liberar el espacio">Vaciar</button>` : ''}
         </div>
       </div>`).join('');
     $$('[data-undo]').forEach((b) => b.addEventListener('click', async () => {
@@ -1258,8 +1265,9 @@ async function loadHistory() {
     $$('[data-purge]').forEach((b) => b.addEventListener('click', async () => {
       const ok = await confirmDialog({ title: '¿Eliminar definitivamente?', bodyHtml: '<p>Se borrarán para siempre los archivos apartados en esta operación y se liberará su espacio.</p>', okText: 'Eliminar definitivamente', danger: true });
       if (!ok) return;
-      try { const r = await ordena.ops.purge(b.dataset.purge); toast(`Liberados ${fmtBytes(r.bytes)}`, 'ok'); loadHistory(); } catch (err) { toast(err.message, 'error'); }
+      try { const r = await ordena.ops.purge(b.dataset.purge); purgeResultToast(r); loadHistory(); } catch (err) { toast(err.message, 'error'); }
     }));
+    $$('[data-reveal-q]').forEach((b) => b.addEventListener('click', () => ordena.ops.revealQuarantine(b.dataset.revealQ).catch((err) => toast(err.message, 'error'))));
   } catch (err) {
     list.innerHTML = `<div class="card">${esc(err.message)}</div>`;
   }

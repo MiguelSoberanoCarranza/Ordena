@@ -29,6 +29,11 @@ test('windows classification', () => {
   assert.equal(w('C:\\Users\\msc_c\\src\\proyecto\\node_modules\\x').tier, 'usuario'); // inside a user folder, project protection handled elsewhere
   assert.equal(w('C:\\Users\\msc_c\\.ssh\\id_rsa').tier, 'sistema');
   assert.equal(w('C:\\XboxGames\\Among Us\\Content\\x').tier, 'aplicacion');
+  const msfs = w('D:\\Otros\\xbox\\Microsoft Flight Simulator 2024\\Content\\x');
+  assert.equal(msfs.tier, 'aplicacion');
+  assert.match(msfs.owner, /Flight Simulator.*Xbox/);
+  assert.equal(w('D:\\WindowsApps\\Microsoft.Game_1.0\\x').tier, 'sistema');
+  assert.equal(w('D:\\Juegos\\Microsoft Flight Simulator 2024\\x').tier, 'aplicacion');
   assert.equal(w('C:\\VulkanSDK\\1.3\\x').tier, 'aplicacion');
   assert.equal(w('D:\\Backups\\foto.jpg').tier, 'otro');
   assert.equal(w('D:\\cache\\x').tier, 'cache');

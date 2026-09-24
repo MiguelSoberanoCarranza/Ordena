@@ -510,10 +510,25 @@ handle('ops:purge', async (id) => {
 handle('ops:purgeAll', async () => {
   const entries = await journal.read();
   let bytes = 0;
+  const failed = [];
   for (const e of entries) {
-    if (e.type === 'quarantine' && !e.purged && !e.undone) bytes += (await purgeQuarantine(e, { journal })).bytes;
+    if (e.type !== 'quarantine' || e.purged || e.undone) continue;
+    const r = await purgeQuarantine(e, { journal });
+    bytes += r.bytes;
+    failed.push(...r.failed);
   }
-  return { bytes };
+  return { bytes, failed, partial: failed.length > 0 };
+});
+
+handle('ops:revealQuarantine', async (id) => {
+  const entries = await journal.read();
+  const entry = entries.find((e) => e.id === id);
+  const first = entry?.entries?.find((x) => x.to);
+  if (!first) throw new Error('No hay carpeta de cuarentena para esta operación');
+  const base = first.to.slice(0, first.to.indexOf(entry.opId) + entry.opId.length);
+  const err = await shell.openPath(base);
+  if (err) throw new Error(err);
+  return true;
 });
 
 handle('ops:quarantineStatus', async () => {

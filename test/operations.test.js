@@ -133,3 +133,19 @@ test('quarantine renames files into an op folder, restores them exactly, and pur
   assert.equal((await journal.read()).find((e) => e.id === res2.journalId).purged, true);
   fs.rmSync(base, { recursive: true, force: true });
 });
+
+test('rmrf removes read-only trees and reports what it cannot delete', async () => {
+  const { rmrf } = require('../src/main/operations');
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ordena-rm-'));
+  const tree = path.join(base, 'tree');
+  fs.mkdirSync(path.join(tree, 'ro'), { recursive: true });
+  fs.writeFileSync(path.join(tree, 'ro', 'file.bin'), 'x');
+  fs.chmodSync(path.join(tree, 'ro', 'file.bin'), 0o444);
+  fs.chmodSync(path.join(tree, 'ro'), 0o555); // directory without write permission: unlink inside fails
+  const r = await rmrf(tree);
+  assert.equal(r.failed.length, 0, JSON.stringify(r.failed));
+  assert.ok(!fs.existsSync(tree));
+  const r2 = await rmrf(path.join(base, 'no-existe'));
+  assert.equal(r2.failed.length, 0);
+  fs.rmSync(base, { recursive: true, force: true });
+});
