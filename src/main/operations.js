@@ -420,10 +420,10 @@ async function rmrf(abs, { onProgress, shouldCancel } = {}) {
     let st;
     try { st = await fsp.lstat(p); } catch (err) { if (err.code !== 'ENOENT') failed.push({ path: p, error: err.code || err.message }); return; }
     if (st.isDirectory() && !st.isSymbolicLink()) {
+      // Make the directory writable first: deleting its children needs write permission on it.
+      try { await fsp.chmod(p, 0o777); } catch { /* best effort */ }
       let entries = [];
-      try { entries = await fsp.readdir(p); } catch (err) {
-        try { await fsp.chmod(p, 0o777); entries = await fsp.readdir(p); } catch (err2) { failed.push({ path: p, error: err2.code || err2.message }); return; }
-      }
+      try { entries = await fsp.readdir(p); } catch (err) { failed.push({ path: p, error: err.code || err.message }); return; }
       for (const name of entries) { await walk(path.join(p, name)); if (cancelled) return; }
       try { await fsp.rmdir(p); } catch (err) {
         if (err.code === 'ENOENT') return;
