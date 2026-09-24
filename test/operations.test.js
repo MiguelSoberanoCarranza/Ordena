@@ -96,3 +96,40 @@ test('relocate copies a folder elsewhere, removes the source, leaves a link and 
   assert.equal((await journal.read())[0].undone, true);
   fs.rmSync(base, { recursive: true, force: true });
 });
+
+test('quarantine renames files into an op folder, restores them exactly, and purges', async () => {
+  const { quarantineFiles, restoreQuarantine, purgeQuarantine } = require('../src/main/operations');
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ordena-q-'));
+  const root = path.join(base, 'root');
+  fs.mkdirSync(path.join(root, 'Docs', 'sub'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'a.log'), Buffer.alloc(100, 1));
+  fs.writeFileSync(path.join(root, 'Docs', 'sub', 'b.tmp'), Buffer.alloc(200, 2));
+  fs.writeFileSync(path.join(root, 'Docs', 'keep.pdf'), 'k');
+  const q = path.join(base, 'quarantine');
+  const journal = new Journal(path.join(base, 'j.json'));
+  const res = await quarantineFiles(root, ['a.log', 'Docs/sub', 'missing.txt'], { quarantineDirFor: async () => q, journal });
+  assert.equal(res.done.length, 2);
+  assert.equal(res.failed.length, 1);
+  assert.equal(res.bytes, 300);
+  assert.ok(!fs.existsSync(path.join(root, 'a.log')));
+  assert.ok(!fs.existsSync(path.join(root, 'Docs', 'sub')));
+  assert.ok(fs.existsSync(path.join(root, 'Docs', 'keep.pdf')));
+  const [entry] = await journal.read();
+  assert.equal(entry.type, 'quarantine');
+  assert.ok(fs.existsSync(path.join(q, entry.opId, 'a.log')));
+  assert.ok(fs.existsSync(path.join(q, entry.opId, 'Docs', 'sub', 'b.tmp')));
+
+  const r = await restoreQuarantine(entry, { journal });
+  assert.equal(r.restored.length, 2);
+  assert.equal(fs.readFileSync(path.join(root, 'Docs', 'sub', 'b.tmp')).length, 200);
+  assert.ok(!fs.existsSync(path.join(q, entry.opId)));
+  assert.equal((await journal.read())[0].undone, true);
+
+  const res2 = await quarantineFiles(root, ['a.log'], { quarantineDirFor: async () => q, journal });
+  const entry2 = (await journal.read()).find((e) => e.id === res2.journalId);
+  const p = await purgeQuarantine(entry2, { journal });
+  assert.equal(p.bytes, 100);
+  assert.ok(!fs.existsSync(path.join(q, entry2.opId)));
+  assert.equal((await journal.read()).find((e) => e.id === res2.journalId).purged, true);
+  fs.rmSync(base, { recursive: true, force: true });
+});

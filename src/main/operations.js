@@ -327,3 +327,131 @@ module.exports.relocate = relocate;
 module.exports.undoRelocate = undoRelocate;
 module.exports.trashPathAbs = trashPathAbs;
 module.exports.walkFiles = walkFiles;
+
+// ---------------------------------------------------------------------------
+// Quarantine: Ordena's own recoverable trash. Files are RENAMED (instant, same volume) into a
+// quarantine folder keeping their relative path, so "Restaurar" puts them back exactly.
+// Space is only freed when the user empties the quarantine.
+// ---------------------------------------------------------------------------
+
+function sanitizeForFs(rel) {
+  return rel.split('/').map((seg) => seg.replace(/[<>:"|?*\u0000-\u001f]/g, '_')).join(path.sep);
+}
+
+/**
+ * @param {string} root            scan root
+ * @param {string[]} rels          files/folders to quarantine (relative to root)
+ * @param {object} o
+ * @param {(abs:string)=>Promise<string>} o.quarantineDirFor  returns the quarantine base dir for that file's volume
+ * @param {(abs:string)=>Promise<void>} [o.trashImpl]        fallback when a rename is impossible
+ */
+async function quarantineFiles(root, rels, { quarantineDirFor, trashImpl, journal, onProgress, isProtected, shouldCancel } = {}) {
+  const opId = `${new Date().toISOString().replace(/[:.]/g, '-')}-${crypto.randomUUID().slice(0, 8)}`;
+  const done = [];
+  const failed = [];
+  let bytes = 0;
+  let fellBack = 0;
+  for (let i = 0; i < rels.length; i += 1) {
+    const rel = rels[i];
+    if (shouldCancel && shouldCancel()) { failed.push({ path: rel, error: 'Cancelado' }); continue; }
+    try {
+      const abs = resolveInside(root, rel);
+      if (isProtected && isProtected(abs)) throw new Error('Ruta del sistema protegida');
+      const st = await fsp.lstat(abs);
+      const size = st.isDirectory() ? await dirSize(abs) : st.size;
+      const base = await quarantineDirFor(abs);
+      const dest = path.join(base, opId, sanitizeForFs(rel.replace(/\\/g, '/')));
+      await fsp.mkdir(path.dirname(dest), { recursive: true });
+      try {
+        await fsp.rename(abs, dest);
+        done.push({ path: rel, to: dest, size, mode: 'quarantine' });
+      } catch (err) {
+        if (!trashImpl || !['EXDEV', 'EPERM', 'EACCES', 'EBUSY'].includes(err.code)) throw err;
+        await trashImpl(abs);
+        fellBack += 1;
+        done.push({ path: rel, size, mode: 'trash' });
+      }
+      bytes += size;
+    } catch (err) {
+      failed.push({ path: rel, error: err.message });
+    }
+    if (onProgress) onProgress({ current: i + 1, total: rels.length });
+  }
+  const entry = {
+    id: crypto.randomUUID(),
+    type: 'quarantine',
+    opId,
+    root,
+    at: new Date().toISOString(),
+    count: done.length,
+    bytes,
+    entries: done,
+    fellBack,
+    undone: false,
+    purged: false,
+  };
+  if (journal && done.length > 0) await journal.append(entry);
+  return { journalId: entry.id, done, failed, bytes, fellBack };
+}
+
+async function dirSize(abs) {
+  let total = 0;
+  const stack = [abs];
+  while (stack.length) {
+    const cur = stack.pop();
+    let entries;
+    try { entries = await fsp.readdir(cur, { withFileTypes: true }); } catch { continue; }
+    for (const e of entries) {
+      const p = path.join(cur, e.name);
+      if (e.isSymbolicLink()) continue;
+      if (e.isDirectory()) stack.push(p);
+      else if (e.isFile()) { try { total += (await fsp.stat(p)).size; } catch { /* skip */ } }
+    }
+  }
+  return total;
+}
+
+/** Put quarantined items back where they were. */
+async function restoreQuarantine(entry, { journal, onProgress } = {}) {
+  const restored = [];
+  const failed = [];
+  const items = entry.entries.filter((e) => e.mode === 'quarantine' && e.to);
+  for (let i = 0; i < items.length; i += 1) {
+    const it = items[i];
+    try {
+      const target = await uniqueDestination(resolveInside(entry.root, it.path));
+      await fsp.mkdir(path.dirname(target), { recursive: true });
+      await fsp.rename(it.to, target);
+      restored.push({ from: it.to, to: path.relative(entry.root, target).split(path.sep).join('/') });
+    } catch (err) {
+      if (err.code === 'ENOENT') failed.push({ path: it.path, error: 'Ya no está en la cuarentena' });
+      else failed.push({ path: it.path, error: err.message });
+    }
+    if (onProgress) onProgress({ current: i + 1, total: items.length });
+  }
+  // Remove the now-empty op folders.
+  for (const base of new Set(items.map((it) => it.to.slice(0, it.to.indexOf(entry.opId) + entry.opId.length)))) {
+    await fsp.rm(base, { recursive: true, force: true }).catch(() => {});
+  }
+  if (journal) await journal.update(entry.id, { undone: failed.length === 0, restoredAt: new Date().toISOString(), restoredCount: restored.length });
+  return { restored, failed, inTrash: entry.entries.filter((e) => e.mode === 'trash').length };
+}
+
+/** Permanently delete the quarantined items of one operation (frees the space). */
+async function purgeQuarantine(entry, { journal } = {}) {
+  let bytes = 0;
+  const bases = new Set();
+  for (const it of entry.entries) {
+    if (it.mode !== 'quarantine' || !it.to) continue;
+    bases.add(it.to.slice(0, it.to.indexOf(entry.opId) + entry.opId.length));
+    bytes += it.size || 0;
+  }
+  for (const base of bases) await fsp.rm(base, { recursive: true, force: true });
+  if (journal) await journal.update(entry.id, { purged: true, purgedAt: new Date().toISOString() });
+  return { bytes };
+}
+
+module.exports.quarantineFiles = quarantineFiles;
+module.exports.restoreQuarantine = restoreQuarantine;
+module.exports.purgeQuarantine = purgeQuarantine;
+module.exports.dirSize = dirSize;

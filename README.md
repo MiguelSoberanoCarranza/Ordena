@@ -10,6 +10,7 @@ Aplicación de escritorio para **Windows y macOS** que analiza una carpeta, prop
 - **Organizar con IA**: MiniMax propone una estructura de carpetas y movimientos concretos. Tú revisas, marcas lo que quieres y aplicas. Todo se puede **deshacer** desde Historial.
 - **Liberar espacio con IA**: sugerencias con nivel de confianza (alta / media / baja) y motivo. Los archivos van a la **Papelera**, nunca se borran directamente.
 - **Preguntar**: chat con contexto de la carpeta ("¿qué puedo borrar para ganar 5 GB?").
+- **Seguridad primero**: cada carpeta se clasifica como sistema, aplicación, caché, personal u otro. Lo del sistema nunca se toca; los datos de aplicaciones y juegos no se proponen para borrar (salvo que actives el modo avanzado) y, si insistes, la confirmación nombra las aplicaciones afectadas. Lo que eliminas va a la **cuarentena de Ordena**: se restaura con un clic desde Historial y el espacio se libera cuando la vacías.
 - **Privacidad**: solo se envía a MiniMax una lista con rutas, tamaños, fechas y categorías. **Nunca el contenido de los archivos.** La clave de API se guarda cifrada con el almacén seguro del sistema (Keychain / DPAPI).
 
 ## Requisitos
@@ -71,9 +72,10 @@ src/main/        proceso principal de Electron
   scanner.js     recorrido de carpetas, tamaños y categorías por carpeta, actualización incremental, duplicados
   cache.js       análisis guardados (JSON comprimido en la carpeta de datos de la app)
   diskinfo.js    discos montados y espacio libre, base de conocimiento de rutas del sistema, rutas protegidas
+  safety.js      clasificación de propiedad (sistema / aplicación / caché / personal) y tope de confianza por tipo
   planner.js     prompts para MiniMax y validación de sus respuestas (rutas seguras, sin cambiar extensiones)
   minimax.js     cliente de la API compatible con OpenAI (Bearer, manejo de <think>, errores base_resp)
-  operations.js  mover, trasladar a otro disco, enviar a la Papelera, borrar carpetas vacías, diario y deshacer
+  operations.js  mover, trasladar a otro disco, cuarentena (restaurar / vaciar), Papelera, carpetas vacías, diario
   settings.js    ajustes y clave de API cifrada con safeStorage
 src/preload/     puente seguro (contextIsolation + sandbox)
 src/renderer/    interfaz (HTML/CSS/JS sin dependencias)

@@ -6,6 +6,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { categoryOf, extensionOf, looksLikeJunk, JUNK_DIR_NAMES } = require('./categories');
 const { toRel } = require('./paths');
+const { classify } = require('./safety');
 
 const DEFAULTS = {
   // 'folder': keep every file (capped) for organizing a specific folder.
@@ -57,6 +58,7 @@ function newDirRecord(rel, name, parent, depth, entriesCount) {
     junkDir: JUNK_DIR_NAMES.has(name),
     cats: {},                          // category -> [count, bytes] for direct files
     junkCount: 0, junkBytes: 0,        // direct junk files
+    tier: 'otro', owner: null,         // ownership classification (see safety.js)
   };
 }
 
@@ -73,6 +75,11 @@ async function readDirLevel(rootAbs, rel, abs, depth, parent, errors) {
     return null;
   }
   const dirRec = newDirRecord(rel, path.basename(abs) || abs, parent, depth, entries.length);
+  const cls = classify(abs);
+  dirRec.tier = cls.tier;
+  dirRec.owner = cls.owner;
+  // Junk heuristics (".log", ".tmp", "(1).exe"…) only apply where deleting cannot break a program.
+  const junkAllowed = cls.tier === 'usuario' || cls.tier === 'cache' || cls.tier === 'otro';
   const files = [];
   const subdirs = [];
   for (const entry of entries) {
@@ -89,7 +96,7 @@ async function readDirLevel(rootAbs, rel, abs, depth, parent, errors) {
     }
     const size = st.size;
     const category = categoryOf(entry.name);
-    const isJunk = looksLikeJunk(entry.name) || dirRec.junkDir;
+    const isJunk = cls.tier === 'cache' ? true : (junkAllowed && (looksLikeJunk(entry.name) || dirRec.junkDir));
     dirRec.directFiles += 1;
     dirRec.directSize += size;
     const c = dirRec.cats[category] || (dirRec.cats[category] = [0, 0]);
@@ -253,9 +260,13 @@ function summarize(scan, options = {}) {
     .slice(0, 30)
     .map((d) => ({ rel: d.rel, name: d.name, size: d.size, fileCount: d.fileCount }));
 
+  const tiers = {};
+  for (const d of scan.dirs) { const t = d.tier || 'otro'; tiers[t] = (tiers[t] || 0) + d.directSize; }
+
   return {
     root: scan.root,
     mode: scan.mode,
+    tiers,
     scannedAt: scan.scannedAt,
     updatedAt: scan.updatedAt,
     totalFiles: scan.totalFiles,

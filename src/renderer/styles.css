@@ -286,3 +286,12 @@ details ul { margin: 6px 0 0; padding-left: 18px; font-family: var(--mono); font
 .chip-filter { background: var(--accent-soft); color: var(--accent); font-weight: 600; display: inline-flex; gap: 6px; align-items: center; }
 .chip-filter button { background: none; border: 0; color: inherit; cursor: pointer; font-size: 13px; padding: 0; line-height: 1; }
 select.btn { padding-right: 28px; }
+
+.kind-aplicacion { background: var(--danger-soft); color: var(--danger); }
+.kind-personal { background: var(--ok-soft); color: var(--ok); }
+.owner { font-size: 11px; color: var(--text-3); margin-top: 2px; }
+.owner strong { color: var(--danger); font-weight: 600; }
+.quarantine-card { border-color: var(--warn); }
+.ack { display: flex; gap: 8px; align-items: flex-start; margin-top: 12px; padding: 10px; border-radius: 8px; background: var(--danger-soft); color: var(--danger); font-size: 13px; }
+.ack input { margin-top: 3px; }
+.affected { margin: 6px 0 0; padding-left: 18px; font-size: 13px; }

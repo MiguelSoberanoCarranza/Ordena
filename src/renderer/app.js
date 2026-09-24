@@ -70,16 +70,18 @@ function toast(msg, kind = '') {
   toastTimer = setTimeout(() => { el.hidden = true; }, kind === 'error' ? 7000 : 3500);
 }
 
-function confirmDialog({ title, bodyHtml, okText = 'Confirmar', danger = false }) {
+function confirmDialog({ title, bodyHtml, okText = 'Confirmar', danger = false, ackText = null }) {
   return new Promise((resolve) => {
     const modal = $('#modal');
     $('#modalTitle').textContent = title;
-    $('#modalBody').innerHTML = bodyHtml;
+    $('#modalBody').innerHTML = bodyHtml + (ackText ? `<label class="ack"><input type="checkbox" id="modalAck" /> <span>${ackText}</span></label>` : '');
     const ok = $('#modalOk');
     ok.textContent = okText;
     ok.className = `btn ${danger ? 'btn-danger' : 'btn-primary'}`;
+    ok.disabled = Boolean(ackText);
+    if (ackText) $('#modalAck').addEventListener('change', (e) => { ok.disabled = !e.target.checked; });
     modal.hidden = false;
-    const done = (v) => { modal.hidden = true; ok.onclick = null; $('#modalCancel').onclick = null; resolve(v); };
+    const done = (v) => { modal.hidden = true; ok.disabled = false; ok.onclick = null; $('#modalCancel').onclick = null; resolve(v); };
     ok.onclick = () => done(true);
     $('#modalCancel').onclick = () => done(false);
     modal.onclick = (e) => { if (e.target === modal) done(false); };
@@ -141,6 +143,9 @@ async function loadSettingsForm() {
   $('#baseUrl').value = s.baseUrl;
   $('#settingSubfolders').checked = s.applyRulesToSubfolders;
   $('#organizeSubfolders').checked = s.applyRulesToSubfolders;
+  $('#settingIncludeApps').checked = s.includeAppData;
+  $('#cleanupIncludeApps').checked = s.includeAppData;
+  $$('input[name="deleteMode"]').forEach((r) => { r.checked = r.value === (s.deleteMode || 'quarantine'); });
   const models = await ordena.settings.models();
   $('#modelList').innerHTML = models.map((m) => `<option value="${esc(m)}"></option>`).join('');
 }
@@ -171,6 +176,8 @@ $('#btnSaveSettings').addEventListener('click', async () => {
 });
 
 $('#settingSubfolders').addEventListener('change', (e) => ordena.settings.set({ applyRulesToSubfolders: e.target.checked }).catch(() => {}));
+$('#settingIncludeApps').addEventListener('change', (e) => { ordena.settings.set({ includeAppData: e.target.checked }).then(refreshSettings).catch(() => {}); $('#cleanupIncludeApps').checked = e.target.checked; });
+$$('input[name="deleteMode"]').forEach((r) => r.addEventListener('change', (e) => { if (e.target.checked) ordena.settings.set({ deleteMode: e.target.value }).then(refreshSettings).catch(() => {}); }));
 
 $('#btnTestApi').addEventListener('click', async () => {
   const key = $('#apiKey').value.trim();
@@ -328,6 +335,12 @@ ordena.onDevView((view) => showView(view));
 ordena.onDevQuery((q) => openFiles(q));
 ordena.onDevAction(async (action) => {
   const map = { organize: ['organize', '#btnOrganize'], cleanup: ['cleanup', '#btnCleanup'], dupes: ['analysis', '#btnDupes'], explain: ['disk', '#btnExplain'], refresh: ['disk', '#btnRefreshDir'], files: ['files', '#filesSelectAll'] };
+  if (action === 'qtest') { // dev: quarantine one file and show history
+    const r = await ordena.ops.trashPath('Instalador Zoom (1).dmg').catch((e) => ({ error: e.message }));
+    console.log('qtest', JSON.stringify(r));
+    showView('history');
+    return;
+  }
   const [view, sel] = map[action] || [];
   if (!sel) return;
   showView(view);
@@ -452,6 +465,68 @@ ordena.onDupesProgress((p) => {
 
 
 
+
+// ---------- ownership / safe delete helpers ----------
+
+const TIER_LABEL = { sistema: 'sistema', aplicacion: 'aplicación', cache: 'caché', usuario: 'personal', otro: 'otro' };
+
+function ownerHtml(e) {
+  if (!e || !e.tier || e.tier === 'otro') return '';
+  if (e.tier === 'aplicacion') return `<div class="owner">Pertenece a <strong>${esc(e.owner || 'una aplicación')}</strong> · borrar puede hacer que deje de funcionar</div>`;
+  if (e.tier === 'cache') return `<div class="owner">Caché${e.owner ? ` de ${esc(e.owner)}` : ''} · se regenera sola</div>`;
+  if (e.tier === 'sistema') return `<div class="owner">Sistema${e.owner ? ` · ${esc(e.owner)}` : ''} · protegido</div>`;
+  return '';
+}
+
+function tierBadge(e) {
+  if (!e || !e.tier || e.tier === 'otro') return '';
+  return `<span class="kind kind-${e.tier === 'usuario' ? 'personal' : esc(e.tier)}" title="${esc(TIER_LABEL[e.tier] || e.tier)}${e.owner ? ` · ${esc(e.owner)}` : ''}">${esc(TIER_LABEL[e.tier] || e.tier)}${e.owner && e.tier === 'aplicacion' ? ` · ${esc(e.owner)}` : ''}</span>`;
+}
+
+/** Groups application-owned items by owner for the confirmation dialog. */
+function affectedApps(items) {
+  const map = new Map();
+  for (const it of items) {
+    if (it.tier !== 'aplicacion') continue;
+    const k = it.owner || 'Aplicación desconocida';
+    const e = map.get(k) || { owner: k, bytes: 0, count: 0 };
+    e.bytes += it.size || 0; e.count += 1;
+    map.set(k, e);
+  }
+  return [...map.values()].sort((a, b) => b.bytes - a.bytes);
+}
+
+function deleteWording(bytes) {
+  const q = state.settings?.deleteMode !== 'trash';
+  return q
+    ? `<p>Se apartarán <strong>${fmtBytes(bytes)}</strong> en la cuarentena de Ordena. Podrás <strong>restaurarlos con un clic</strong> desde Historial; el espacio se libera cuando vacíes la cuarentena.</p>`
+    : `<p>Liberarás aproximadamente <strong>${fmtBytes(bytes)}</strong>. Los archivos van a la Papelera del sistema y podrás recuperarlos desde allí.</p>`;
+}
+
+function deleteConfirm({ items, title }) {
+  const bytes = items.reduce((a, f) => a + (f.size || 0), 0);
+  const apps = affectedApps(items);
+  const low = items.filter((s) => s.confidence === 'baja').length;
+  let body = deleteWording(bytes);
+  if (apps.length) {
+    body += `<p class="warn-text"><strong>Atención:</strong> ${apps.length === 1 ? 'una aplicación puede dejar de funcionar' : `${apps.length} aplicaciones pueden dejar de funcionar`} o perder su configuración:</p><ul class="affected">${apps.slice(0, 8).map((a) => `<li><strong>${esc(a.owner)}</strong> · ${a.count} archivo${a.count === 1 ? '' : 's'} · ${fmtBytes(a.bytes)}</li>`).join('')}${apps.length > 8 ? `<li>… y ${apps.length - 8} más</li>` : ''}</ul><p class="small muted">Lo recomendable es liberar ese espacio desde la propia aplicación (desinstalar, limpiar caché en sus ajustes).</p>`;
+  }
+  if (low) body += `<p class="small warn-text">${low} de los archivos tienen confianza baja. Revísalos antes de continuar.</p>`;
+  return confirmDialog({
+    title,
+    bodyHtml: body,
+    okText: state.settings?.deleteMode !== 'trash' ? 'Apartar en cuarentena' : 'Enviar a la Papelera',
+    danger: true,
+    ackText: apps.length ? `Entiendo que ${apps.length === 1 ? esc(apps[0].owner) : 'estas aplicaciones'} puede${apps.length === 1 ? '' : 'n'} dejar de funcionar y quiero continuar.` : null,
+  });
+}
+
+function deleteDoneToast(res) {
+  if (res.failed?.length) return toast(`${res.done.length} procesados, ${res.failed.length} fallaron: ${res.failed[0].error}`, 'error');
+  if (res.mode === 'quarantine') return toast(`${fmtBytes(res.bytes)} apartados en cuarentena · restaurar o vaciar desde Historial`, 'ok');
+  return toast(`Liberados ${fmtBytes(res.bytes)} (en la Papelera)`, 'ok');
+}
+
 // ---------- files (filtered list) ----------
 
 const FILTER_LABELS = {
@@ -513,14 +588,14 @@ function renderFiles() {
   $('#filesTable tbody').innerHTML = res.items.length ? res.items.map((f, i) => `
     <tr>
       <td><input type="checkbox" class="file-check" data-index="${i}" ${f.protected ? 'disabled title="Ruta del sistema protegida"' : ''} /></td>
-      <td>${pathHtml(f.rel)}${hintHtml(f)}</td>
-      <td>${kindBadge(f.kind)}</td>
+      <td>${pathHtml(f.rel)}${ownerHtml(f)}${hintHtml(f)}</td>
+      <td>${kindBadge(f.kind)} ${tierBadge(f)}</td>
       <td class="num"><div class="size-cell"><span>${fmtBytes(f.size)}</span><div class="size-bar"><div class="size-bar-fill" style="width:${Math.max(1, (f.size / max) * 100)}%"></div></div></div></td>
       <td>${fmtDate(f.mtimeMs)}</td>
       <td><div class="row-actions">
         <button class="btn btn-ghost btn-sm" data-reveal="${esc(f.rel)}">Mostrar</button>
         <button class="btn btn-ghost btn-sm" data-explore-dir="${esc(f.dir)}" title="Abrir la carpeta en Explorar">Carpeta</button>
-        ${f.protected ? '<span class="kind kind-sistema">protegida</span>' : `<button class="btn btn-ghost btn-sm" data-relocate="${esc(f.rel)}">Mover a otro disco…</button><button class="btn btn-ghost btn-sm" data-trash-path="${esc(f.rel)}">Papelera</button>`}
+        ${f.protected ? '<span class="kind kind-sistema">protegida</span>' : `<button class="btn btn-ghost btn-sm" data-relocate="${esc(f.rel)}">Mover a otro disco…</button><button class="btn btn-ghost btn-sm" data-trash-path="${esc(f.rel)}">Eliminar</button>`}
       </div></td>
     </tr>`).join('') : '<tr><td colspan="6" class="empty">No hay archivos con estos filtros.</td></tr>';
   $('#filesMoreRow').hidden = res.total <= res.items.length;
@@ -541,9 +616,11 @@ function selectedFiles() {
 function updateFilesSelection() {
   const sel = selectedFiles();
   const bytes = sel.reduce((a, f) => a + f.size, 0);
-  $('#filesSelectedText').textContent = sel.length ? `${sel.length} seleccionado${sel.length === 1 ? '' : 's'} · ${fmtBytes(bytes)}` : 'Marca archivos para enviarlos a la Papelera en bloque';
+  $('#filesSelectedText').textContent = sel.length ? `${sel.length} seleccionado${sel.length === 1 ? '' : 's'} · ${fmtBytes(bytes)}` : 'Marca archivos para eliminarlos en bloque';
+  const verb = state.settings?.deleteMode !== 'trash' ? 'Apartar' : 'Enviar';
+  const where = state.settings?.deleteMode !== 'trash' ? 'en cuarentena' : 'a la Papelera';
   $('#btnFilesTrash').disabled = sel.length === 0 || state.busy;
-  $('#btnFilesTrash').textContent = sel.length ? `Enviar ${sel.length} a la Papelera (${fmtBytes(bytes)})` : 'Enviar a la Papelera';
+  $('#btnFilesTrash').textContent = sel.length ? `${verb} ${sel.length} ${where} (${fmtBytes(bytes)})` : `${verb} ${where}`;
 }
 
 $('#filesSelectAll').addEventListener('click', () => { $$('#filesTable .file-check:not(:disabled)').forEach((c) => { c.checked = true; }); updateFilesSelection(); });
@@ -559,22 +636,15 @@ $('#filesSearch').addEventListener('input', (e) => {
 $('#btnFilesTrash').addEventListener('click', async () => {
   const sel = selectedFiles();
   if (!sel.length) return;
-  const ok = await confirmDialog({
-    title: `¿Enviar ${sel.length} archivo${sel.length === 1 ? '' : 's'} a la Papelera?`,
-    bodyHtml: `<p>Liberarás aproximadamente <strong>${fmtBytes(sel.reduce((a, f) => a + f.size, 0))}</strong>. Van a la Papelera del sistema y podrás recuperarlos desde allí.</p>`,
-    okText: 'Enviar a la Papelera',
-    danger: true,
-  });
+  const ok = await deleteConfirm({ items: sel, title: `¿Eliminar ${sel.length} archivo${sel.length === 1 ? '' : 's'}?` });
   if (!ok) return;
   setBusy(true);
   try {
     const res = await ordena.ops.trash(sel.map((f) => f.rel));
     state.summary = res.summary;
     state.duplicates = null;
-    renderAnalysis();
-    await loadFiles();
-    if (state.diskLevel) await loadDisk(state.diskRel);
-    toast(res.failed.length ? `${res.done.length} enviados, ${res.failed.length} fallaron: ${res.failed[0].error}` : `Liberados ${fmtBytes(res.bytes)} ✓`, res.failed.length ? 'error' : 'ok');
+    await refreshViews();
+    deleteDoneToast(res);
   } catch (err) {
     toast(err.message, 'error');
   } finally {
@@ -603,7 +673,7 @@ function actionsHtml(e) {
   return `<div class="row-actions">
     <button class="btn btn-ghost btn-sm" data-reveal="${esc(e.rel)}" title="Mostrar en ${navigator.platform.includes('Mac') ? 'Finder' : 'el Explorador'}">Mostrar</button>
     ${canAct ? `<button class="btn btn-ghost btn-sm" data-relocate="${esc(e.rel)}" title="Copiar a otro disco, borrar aquí y dejar un enlace">Mover a otro disco…</button>` : ''}
-    ${canAct ? `<button class="btn btn-ghost btn-sm" data-trash-path="${esc(e.rel)}">Papelera</button>` : '<span class="kind kind-sistema" title="Protegida por Ordena">protegida</span>'}
+    ${canAct ? `<button class="btn btn-ghost btn-sm" data-trash-path="${esc(e.rel)}">Eliminar</button>` : '<span class="kind kind-sistema" title="Protegida por Ordena">protegida</span>'}
   </div>`;
 }
 
@@ -640,8 +710,8 @@ function renderDisk() {
   $('#diskDirsNote').textContent = level.dirs.length ? `· ordenadas por tamaño` : '';
   $('#diskDirsTable tbody').innerHTML = level.dirs.length ? level.dirs.map((d) => `
     <tr>
-      <td><button class="dir-link" data-open-dir="${esc(d.rel)}">📁 ${esc(d.name)}</button>${hintHtml(d)}</td>
-      <td>${kindBadge(d.kind)}</td>
+      <td><button class="dir-link" data-open-dir="${esc(d.rel)}">📁 ${esc(d.name)}</button>${ownerHtml(d)}${hintHtml(d)}</td>
+      <td>${kindBadge(d.kind)} ${tierBadge(d)}</td>
       <td class="num">${sizeCell(d.size)}</td>
       <td class="num">${fmtInt(d.fileCount)}</td>
       <td>${actionsHtml(d)}</td>
@@ -650,8 +720,8 @@ function renderDisk() {
   $('#diskFilesNote').textContent = level.filesPartial ? '· solo archivos de 1 MB o más' : '';
   $('#diskFilesTable tbody').innerHTML = level.files.length ? level.files.map((f) => `
     <tr>
-      <td><span class="path">${esc(f.name)}</span>${hintHtml(f)}</td>
-      <td>${kindBadge(f.kind)}</td>
+      <td><span class="path">${esc(f.name)}</span>${ownerHtml(f)}${hintHtml(f)}</td>
+      <td>${kindBadge(f.kind)} ${tierBadge(f)}</td>
       <td class="num">${sizeCell(f.size)}</td>
       <td>${fmtDate(f.mtimeMs)}</td>
       <td>${actionsHtml(f)}</td>
@@ -794,13 +864,18 @@ async function runRelocate(rel, dest, leaveLink) {
 async function trashPathDialog(rel) {
   const e = entryByRel(rel);
   if (!e) return;
+  const extra = (e.hint && e.hint.del === 'no' ? `<p class="warn-text">Aviso: ${esc(e.hint.what)} No se recomienda borrarla.</p>` : '') +
+    (e.hint && e.hint.del === 'parcial' ? `<p class="warn-text">Aviso: solo parte de su contenido es prescindible. ${esc(e.hint.how)}</p>` : '');
+  const items = [{ ...e, size: e.size }];
+  const bytes = e.size || 0;
+  const apps = affectedApps(items);
   const ok = await confirmDialog({
-    title: `¿Enviar "${e.name}" a la Papelera?`,
-    bodyHtml: `<p>${e.isDir ? `La carpeta completa (${fmtInt(e.fileCount)} archivos, ${fmtBytes(e.size)})` : `El archivo (${fmtBytes(e.size)})`} irá a la Papelera del sistema; podrás recuperarlo desde allí.</p>` +
-      (e.hint && e.hint.del === 'no' ? `<p class="warn-text">Aviso: ${esc(e.hint.what)} No se recomienda borrarla.</p>` : '') +
-      (e.hint && e.hint.del === 'parcial' ? `<p class="warn-text">Aviso: solo parte de su contenido es prescindible. ${esc(e.hint.how)}</p>` : ''),
-    okText: 'Enviar a la Papelera',
+    title: `¿Eliminar "${e.name}"?`,
+    bodyHtml: `<p>${e.isDir ? `La carpeta completa (${fmtInt(e.fileCount)} archivos, ${fmtBytes(bytes)})` : `El archivo (${fmtBytes(bytes)})`}.</p>` + deleteWording(bytes) + extra +
+      (apps.length ? `<p class="warn-text"><strong>Atención:</strong> pertenece a <strong>${esc(apps[0].owner)}</strong>, que puede dejar de funcionar o perder su configuración. Lo recomendable es liberar espacio desde la propia aplicación.</p>` : ''),
+    okText: state.settings?.deleteMode !== 'trash' ? 'Apartar en cuarentena' : 'Enviar a la Papelera',
     danger: true,
+    ackText: apps.length ? `Entiendo que ${esc(apps[0].owner)} puede dejar de funcionar y quiero continuar.` : null,
   });
   if (!ok) return;
   setBusy(true);
@@ -809,7 +884,7 @@ async function trashPathDialog(rel) {
     state.summary = res.summary;
     state.duplicates = null;
     await refreshViews();
-    toast(`Liberados ${fmtBytes(res.bytes)} (en la Papelera)`, 'ok');
+    deleteDoneToast({ done: [1], failed: [], bytes: res.bytes, mode: res.mode });
   } catch (err) {
     toast(err.message, 'error');
   } finally {
@@ -966,9 +1041,9 @@ function renderCleanupPlan() {
   $('#cleanupTable tbody').innerHTML = shown.length ? shown.map((s, i) => `
     <tr data-conf="${s.confidence}" ${visible.has(s.confidence) ? '' : 'hidden'}>
       <td><input type="checkbox" class="cl-check" data-index="${i}" ${s.confidence === 'alta' ? 'checked' : ''} /></td>
-      <td>${pathHtml(s.path)}<div class="small muted">${esc(s.category)} · ${fmtDate(s.mtimeMs)}</div></td>
+      <td>${pathHtml(s.path)}<div class="small muted">${esc(s.category)} · ${fmtDate(s.mtimeMs)}</div>${ownerHtml(s)}</td>
       <td class="small">${esc(s.reason)}</td>
-      <td><span class="badge badge-${s.confidence}">${s.confidence}</span><div class="small muted">${esc(s.kind)}</div></td>
+      <td><span class="badge badge-${s.confidence}">${s.confidence}</span><div class="small muted">${esc(s.kind)}</div>${tierBadge(s)}</td>
       <td class="num">${fmtBytes(s.size)}</td>
       <td><button class="btn-link" data-reveal="${esc(s.path)}">Mostrar</button></td>
     </tr>`).join('') : '<tr><td colspan="6" class="empty">La IA no encontró nada que valga la pena eliminar.</td></tr>';
@@ -1002,8 +1077,10 @@ function updateCleanupSelection() {
   const bytes = sel.reduce((a, s) => a + s.size, 0);
   const hidden = state.cleanupPlan ? Math.max(0, state.cleanupPlan.suggestions.length - (state.cleanupLimit || 300)) : 0;
   $('#cleanupSelectedText').textContent = (sel.length ? `${sel.length} archivo${sel.length === 1 ? '' : 's'} · liberarías ${fmtBytes(bytes)}` : 'Nada seleccionado') + (hidden ? ` · ${fmtInt(hidden)} sugerencias no mostradas (pulsa "Mostrar más" para verlas)` : '');
+  const verb = state.settings?.deleteMode !== 'trash' ? 'Apartar' : 'Enviar';
+  const where = state.settings?.deleteMode !== 'trash' ? 'en cuarentena' : 'a la Papelera';
   $('#btnTrash').disabled = sel.length === 0 || state.busy;
-  $('#btnTrash').textContent = sel.length ? `Enviar ${sel.length} a la Papelera (${fmtBytes(bytes)})` : 'Enviar a la Papelera';
+  $('#btnTrash').textContent = sel.length ? `${verb} ${sel.length} ${where} (${fmtBytes(bytes)})` : `${verb} ${where}`;
 }
 
 $('#clSelectAll').addEventListener('click', () => { $$('#cleanupTable tbody tr:not([hidden]) .cl-check').forEach((c) => { c.checked = true; }); updateCleanupSelection(); });
@@ -1016,7 +1093,7 @@ $('#btnCleanup').addEventListener('click', async () => {
   $('#btnCleanupCancel').hidden = false;
   setBusy(true);
   try {
-    const { plan, duplicates } = await ordena.ai.cleanup({ instructions: $('#cleanupInstructions').value });
+    const { plan, duplicates } = await ordena.ai.cleanup({ instructions: $('#cleanupInstructions').value, includeAppData: $('#cleanupIncludeApps').checked });
     state.cleanupPlan = plan;
     state.cleanupLimit = 300;
     state.duplicates = duplicates;
@@ -1038,14 +1115,7 @@ $('#btnCleanupCancel').addEventListener('click', () => ordena.ai.cancel());
 $('#btnTrash').addEventListener('click', async () => {
   const sel = selectedCleanup();
   if (!sel.length) return;
-  const low = sel.filter((s) => s.confidence === 'baja').length;
-  const ok = await confirmDialog({
-    title: `¿Enviar ${sel.length} archivo${sel.length === 1 ? '' : 's'} a la Papelera?`,
-    bodyHtml: `<p>Liberarás aproximadamente <strong>${fmtBytes(sel.reduce((a, s) => a + s.size, 0))}</strong>. Los archivos van a la Papelera del sistema y podrás recuperarlos desde allí.</p>` +
-      (low ? `<p class="small" style="color:var(--danger)">Atención: ${low} de ellos tienen confianza baja. Revísalos antes de continuar.</p>` : ''),
-    okText: 'Enviar a la Papelera',
-    danger: true,
-  });
+  const ok = await deleteConfirm({ items: sel, title: `¿Eliminar ${sel.length} archivo${sel.length === 1 ? '' : 's'}?` });
   if (!ok) return;
   setBusy(true);
   try {
@@ -1057,7 +1127,7 @@ $('#btnTrash').addEventListener('click', async () => {
     renderAnalysis();
     renderDuplicates();
     renderCleanupPlan();
-    toast(res.failed.length ? `${res.done.length} enviados, ${res.failed.length} fallaron: ${res.failed[0].error}` : `Liberados ${fmtBytes(res.bytes)} ✓`, res.failed.length ? 'error' : 'ok');
+    deleteDoneToast(res);
   } catch (err) {
     toast(err.message, 'error');
   } finally {
@@ -1125,34 +1195,70 @@ $('#btnChatClear').addEventListener('click', () => {
 
 // ---------- history ----------
 
+async function loadQuarantineStatus() {
+  try {
+    const q = await ordena.ops.quarantineStatus();
+    const card = $('#quarantineCard');
+    card.hidden = q.count === 0;
+    if (q.count) $('#quarantineText').textContent = `${fmtBytes(q.bytes)} apartados en ${q.count} operación${q.count === 1 ? '' : 'es'}${q.oldest ? ` · la más antigua ${fmtAgo(q.oldest)}` : ''}. Restaura lo que necesites antes de vaciar.`;
+  } catch { /* ignore */ }
+}
+
+$('#btnPurgeAll').addEventListener('click', async () => {
+  const ok = await confirmDialog({ title: '¿Vaciar la cuarentena?', bodyHtml: '<p>Se eliminarán <strong>definitivamente</strong> todos los archivos apartados y se liberará su espacio. Esta acción no se puede deshacer.</p>', okText: 'Vaciar definitivamente', danger: true, ackText: 'He comprobado que todo funciona y no necesito restaurar nada.' });
+  if (!ok) return;
+  try {
+    const r = await ordena.ops.purgeAll();
+    toast(`Liberados ${fmtBytes(r.bytes)}`, 'ok');
+    loadHistory();
+  } catch (err) { toast(err.message, 'error'); }
+});
+
+function historyTitle(e) {
+  if (e.type === 'move') return `Movidos ${e.count} archivos`;
+  if (e.type === 'relocate') return `Trasladado a otro disco: ${esc(e.src.split(/[\\/]/).pop())} (${fmtBytes(e.bytes)})`;
+  if (e.type === 'quarantine') return `${e.purged ? 'Eliminados definitivamente' : e.undone ? 'Restaurados' : 'En cuarentena'}: ${e.count} elemento${e.count === 1 ? '' : 's'} (${fmtBytes(e.bytes)})${e.fellBack ? ` · ${e.fellBack} fueron a la Papelera del sistema` : ''}`;
+  return `Enviados ${e.count} archivos a la Papelera${e.bytes ? ` (${fmtBytes(e.bytes)})` : ''}`;
+}
+
 async function loadHistory() {
   const list = $('#historyList');
+  loadQuarantineStatus();
   try {
     const entries = await ordena.ops.journal();
     if (!entries.length) { list.innerHTML = '<div class="card empty">Todavía no has realizado operaciones.</div>'; return; }
     list.innerHTML = entries.map((e) => `
       <div class="card history-item ${e.undone ? 'undone' : ''}">
         <div>
-          <div><strong>${e.type === 'move' ? `Movidos ${e.count} archivos` : e.type === 'relocate' ? `Trasladado a otro disco: ${esc(e.src.split(/[\\/]/).pop())} (${fmtBytes(e.bytes)})` : `Enviados ${e.count} archivos a la Papelera${e.bytes ? ` (${fmtBytes(e.bytes)})` : ''}`}</strong>${e.undone ? ' <span class="badge badge-neutral">deshecho</span>' : ''}</div>
+          <div><strong>${historyTitle(e)}</strong>${e.undone && e.type !== 'quarantine' ? ' <span class="badge badge-neutral">deshecho</span>' : ''}</div>
           <div class="meta">${new Date(e.at).toLocaleString('es')} · <span class="path">${esc(e.root)}</span></div>
           <details><summary>Ver detalle</summary><ul>${e.entries.slice(0, 200).map((x) => `<li>${esc(x.from ?? x.path)}${x.to ? ` → ${esc(x.to)}` : ''}</li>`).join('')}</ul></details>
         </div>
-        ${(e.type === 'move' || e.type === 'relocate') && !e.undone ? `<button class="btn" data-undo="${e.id}">Deshacer</button>` : ''}
+        <div class="row gap">
+          ${(e.type === 'move' || e.type === 'relocate') && !e.undone ? `<button class="btn" data-undo="${e.id}">Deshacer</button>` : ''}
+          ${e.type === 'quarantine' && !e.undone && !e.purged ? `<button class="btn btn-primary" data-undo="${e.id}">Restaurar</button><button class="btn btn-ghost" data-purge="${e.id}" title="Eliminar definitivamente y liberar el espacio">Vaciar</button>` : ''}
+        </div>
       </div>`).join('');
     $$('[data-undo]').forEach((b) => b.addEventListener('click', async () => {
-      const ok = await confirmDialog({ title: '¿Deshacer esta operación?', bodyHtml: '<p>Los archivos volverán a su ubicación anterior. Si fue un traslado a otro disco, se copiarán de vuelta y se borrará la copia.</p>', okText: 'Deshacer' });
+      const ok = await confirmDialog({ title: '¿Restaurar / deshacer esta operación?', bodyHtml: '<p>Los archivos volverán a su ubicación anterior. Si fue un traslado a otro disco, se copiarán de vuelta y se borrará la copia.</p>', okText: 'Restaurar' });
       if (!ok) return;
       b.disabled = true;
       try {
         const res = await ordena.ops.undo(b.dataset.undo);
         if (res.summary) { state.summary = res.summary; state.duplicates = null; state.organizePlan = null; renderAnalysis(); renderDuplicates(); renderOrganizePlan(); }
         if (res.needsRescan) toast('Restaurado. Pulsa "Reanalizar" para actualizar los tamaños.', 'ok');
+        else if (res.inTrash) toast(`${res.restored.length} restaurados; ${res.inTrash} estaban en la Papelera del sistema y se recuperan desde allí.`, 'ok');
         else toast(res.failed.length ? `${res.restored.length} restaurados, ${res.failed.length} fallaron` : `${res.restored.length} archivos restaurados ✓`, res.failed.length ? 'error' : 'ok');
         loadHistory();
       } catch (err) {
         toast(err.message, 'error');
         b.disabled = false;
       }
+    }));
+    $$('[data-purge]').forEach((b) => b.addEventListener('click', async () => {
+      const ok = await confirmDialog({ title: '¿Eliminar definitivamente?', bodyHtml: '<p>Se borrarán para siempre los archivos apartados en esta operación y se liberará su espacio.</p>', okText: 'Eliminar definitivamente', danger: true });
+      if (!ok) return;
+      try { const r = await ordena.ops.purge(b.dataset.purge); toast(`Liberados ${fmtBytes(r.bytes)}`, 'ok'); loadHistory(); } catch (err) { toast(err.message, 'error'); }
     }));
   } catch (err) {
     list.innerHTML = `<div class="card">${esc(err.message)}</div>`;

@@ -9,6 +9,8 @@ const DEFAULTS = {
   model: DEFAULT_MODEL,
   applyRulesToSubfolders: false,
   theme: 'system',
+  deleteMode: 'quarantine',   // 'quarantine' (Ordena's recoverable folder) | 'trash' (system Recycle Bin)
+  includeAppData: false,      // let the cleanup AI see application data (advanced)
 };
 
 /**
@@ -54,6 +56,8 @@ class Settings {
       model: s.model,
       applyRulesToSubfolders: Boolean(s.applyRulesToSubfolders),
       theme: s.theme,
+      deleteMode: s.deleteMode === 'trash' ? 'trash' : 'quarantine',
+      includeAppData: Boolean(s.includeAppData),
       hasApiKey: Boolean(s.apiKeyEncrypted || s.apiKeyPlain),
       apiKeyHint: s.apiKeyHint || '',
       encrypted: Boolean(s.apiKeyEncrypted),
@@ -67,6 +71,8 @@ class Settings {
     if (typeof patch.model === 'string' && patch.model.trim()) s.model = patch.model.trim();
     if (typeof patch.applyRulesToSubfolders === 'boolean') s.applyRulesToSubfolders = patch.applyRulesToSubfolders;
     if (typeof patch.theme === 'string') s.theme = patch.theme;
+    if (patch.deleteMode === 'trash' || patch.deleteMode === 'quarantine') s.deleteMode = patch.deleteMode;
+    if (typeof patch.includeAppData === 'boolean') s.includeAppData = patch.includeAppData;
     if (typeof patch.apiKey === 'string') {
       const key = patch.apiKey.trim();
       delete s.apiKeyEncrypted;

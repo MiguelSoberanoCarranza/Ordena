@@ -52,6 +52,9 @@ contextBridge.exposeInMainWorld('ordena', {
     journal: () => invoke('ops:journal'),
     undo: (id) => invoke('ops:undo', id),
     cancel: () => invoke('ops:cancel'),
+    purge: (id) => invoke('ops:purge', id),
+    purgeAll: () => invoke('ops:purgeAll'),
+    quarantineStatus: () => invoke('ops:quarantineStatus'),
   },
   shell: {
     reveal: (rel) => invoke('shell:reveal', rel),

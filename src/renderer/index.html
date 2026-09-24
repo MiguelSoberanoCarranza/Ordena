@@ -242,8 +242,11 @@
         <div class="card">
           <label class="label" for="cleanupInstructions">Instrucciones para la IA (opcional)</label>
           <textarea id="cleanupInstructions" rows="2" placeholder="Ej.: sé agresivo con instaladores y archivos comprimidos, conserva todos los PDF…"></textarea>
-          <div class="row between mt-s">
-            <span class="small muted">Primero se buscan duplicados (puede tardar en carpetas grandes). Nada se borra sin tu confirmación.</span>
+          <div class="row between mt-s wrap">
+            <div>
+              <div class="small muted">Primero se buscan duplicados (puede tardar en carpetas grandes). Nada se borra sin tu confirmación.</div>
+              <label class="check"><input type="checkbox" id="cleanupIncludeApps" /> Incluir datos de aplicaciones y juegos (avanzado: pueden dejar de funcionar)</label>
+            </div>
             <div class="row gap">
               <button class="btn btn-ghost" id="btnCleanupCancel" hidden>Cancelar</button>
               <button class="btn btn-primary" id="btnCleanup">🧹 Analizar con IA</button>
@@ -306,7 +309,13 @@
       <!-- HISTORY -->
       <section class="view" id="view-history">
         <div class="view-header"><h2>Historial de operaciones</h2><button class="btn btn-ghost btn-sm" id="btnOpenTrash">Abrir Papelera</button></div>
-        <p class="muted">Los movimientos y los traslados a otro disco se pueden deshacer desde aquí. Los archivos enviados a la Papelera se recuperan desde la Papelera del sistema.</p>
+        <p class="muted">Lo que eliminas se aparta en la cuarentena de Ordena: se puede restaurar con un clic y el espacio se libera cuando la vacías. Los movimientos y traslados también se deshacen desde aquí.</p>
+        <div class="card quarantine-card" id="quarantineCard" hidden>
+          <div class="row between wrap">
+            <div><h3>Cuarentena</h3><div class="small muted" id="quarantineText"></div></div>
+            <button class="btn btn-danger" id="btnPurgeAll">Vaciar cuarentena y liberar espacio</button>
+          </div>
+        </div>
         <div id="historyList"></div>
       </section>
 
@@ -339,6 +348,13 @@
             <button class="btn" id="btnTestApi">Probar conexión</button>
             <span id="settingsStatus" class="small"></span>
           </div>
+        </div>
+        <div class="card">
+          <h3>Seguridad al eliminar</h3>
+          <label class="open-option"><input type="radio" name="deleteMode" value="quarantine" /><div><strong>Cuarentena de Ordena (recomendado)</strong><div class="small">Los archivos se apartan en una carpeta de Ordena en el mismo disco. Se restauran con un clic desde Historial y el espacio se libera cuando vacías la cuarentena.</div></div></label>
+          <label class="open-option"><input type="radio" name="deleteMode" value="trash" /><div><strong>Papelera del sistema</strong><div class="small">Como borrar desde el Explorador o Finder. La recuperación es manual desde la Papelera.</div></div></label>
+          <label class="check mt-s"><input type="checkbox" id="settingIncludeApps" /> Permitir que la IA proponga borrar datos de aplicaciones y juegos (avanzado)</label>
+          <p class="small muted">Las carpetas del sistema (Windows, Program Files, /System…) nunca se tocan, se elija lo que se elija.</p>
         </div>
         <div class="card">
           <h3>Comportamiento</h3>

@@ -5,6 +5,7 @@
 const path = require('path');
 const { formatBytes } = require('./scanner');
 const { sanitizeRelPath } = require('./paths');
+const { maxConfidence, capConfidence, TIER_LABEL } = require('./safety');
 
 const MAX_LISTED_FILES = 350;
 const PROTECTED_SEGMENTS = new Set(['.git', 'node_modules', '.svn', '.hg', '__pycache__', '.venv', 'venv']);
@@ -75,37 +76,46 @@ function buildOrganizeMessages(summary, files, { instructions = '' } = {}) {
   ];
 }
 
-const CLEANUP_SYSTEM = `Eres "Ordena", un asistente que ayuda a liberar espacio en disco de forma segura.
-Recibes candidatos detectados automáticamente: archivos más grandes, archivos grandes sin usar, archivos temporales/basura y grupos de duplicados.
+const CLEANUP_SYSTEM = `Eres "Ordena", un asistente que ayuda a liberar espacio en disco de forma SEGURA. Tu prioridad es no romper nada.
+Recibes candidatos detectados automáticamente. Cada línea trae la ruta, el tamaño, la antigüedad y una etiqueta de PROPIETARIO entre corchetes:
+- [personal] carpetas del usuario (Descargas, Documentos, Escritorio…)
+- [caché: X] cachés o temporales que la aplicación X regenera sola
+- [aplicación: X] datos que pertenecen a la aplicación o juego X. Borrarlos puede romper X o borrar su configuración o partidas.
+- [otro] carpetas sin dueño claro (discos externos, carpetas propias)
 Responde ÚNICAMENTE con un objeto JSON válido, sin texto adicional, con esta forma:
 {
   "summary": "resumen breve del potencial de ahorro y estrategia",
-  "suggestions": [{"path": "ruta/relativa", "reason": "por qué se puede eliminar", "confidence": "alta|media|baja", "kind": "duplicado|temporal|instalador|grande_sin_uso|otro"}],
-  "tips": ["consejo general breve"]
+  "suggestions": [{"path": "ruta/relativa", "reason": "por qué se puede eliminar", "confidence": "alta|media|baja", "kind": "duplicado|temporal|instalador|grande_sin_uso|cache|otro"}],
+  "tips": ["consejo general breve; incluye cómo liberar espacio DESDE las aplicaciones cuando lo grande sea de una aplicación"]
 }
-Reglas:
-- Solo puedes sugerir rutas que aparezcan en los candidatos. Usa rutas relativas exactas, tal como se muestran.
-- En grupos de duplicados conserva UNA copia (la de ruta más corta o mejor ubicada) y sugiere eliminar el resto.
-- Confianza "alta": temporales, caches, duplicados exactos, instaladores (.dmg/.exe/.msi/.pkg) descargados hace tiempo, descargas repetidas "(1)", "(2)".
-- Confianza "media": archivos comprimidos ya extraídos, archivos grandes sin modificar en más de un año.
-- Confianza "baja": documentos personales, fotos, videos únicos. Nunca sugieras eliminar fotos o videos personales salvo que sean duplicados exactos.
-- Los archivos se envían a la Papelera, no se borran definitivamente, pero sé prudente igualmente.
-- Máximo 200 sugerencias. Ordena de mayor a menor ahorro.`;
+Reglas obligatorias:
+- Solo puedes sugerir rutas que aparezcan en los candidatos, con la ruta exacta.
+- NUNCA sugieras nada etiquetado [aplicación: X] salvo que sea un duplicado exacto o un instalador ya usado en una carpeta de descargas. Para esos casos, en "tips" explica cómo liberar espacio desde la propia aplicación (desinstalar, limpiar caché en sus ajustes, borrar imágenes de emulador desde Android Studio, "docker system prune", etc.).
+- Duplicados: conserva UNA copia (ruta más corta o mejor ubicada) y sugiere el resto.
+- "alta" solo para: [caché], temporales evidentes, duplicados exactos, instaladores (.dmg/.exe/.msi/.pkg) en Descargas con más de 30 días, y descargas repetidas "(1)", "(2)".
+- "media" para archivos comprimidos ya extraídos y archivos grandes sin modificar en más de un año que sean [personal] u [otro] y no sean fotos, vídeos ni documentos.
+- "baja" para documentos personales, fotos, vídeos únicos. Nunca sugieras fotos o vídeos personales salvo que sean duplicados exactos.
+- Máximo 200 sugerencias, de mayor a menor ahorro.`;
 
-function buildCleanupMessages(summary, duplicates, { instructions = '', isProtected: extra = null } = {}) {
+function buildCleanupMessages(summary, duplicates, options = {}) {
+  const { instructions = '', isProtected: extra = null } = options;
   const now = Date.now();
   const blocked = (rel) => isProtected(rel) || (extra ? extra(rel) : false);
-  summary = { ...summary, largest: summary.largest.filter((f) => !blocked(f.rel)), oldLarge: summary.oldLarge.filter((f) => !blocked(f.rel)), junk: summary.junk.filter((f) => !blocked(f.rel)) };
+  const tierOf = options.tierOf || (() => ({ tier: 'otro', owner: null }));
+  const includeApps = Boolean(options.includeAppData);
+  const usable = (f) => { if (blocked(f.rel)) return false; const t = tierOf(f.rel).tier; return t !== 'sistema' && (includeApps || t !== 'aplicacion'); };
+  summary = { ...summary, largest: summary.largest.filter(usable), oldLarge: summary.oldLarge.filter(usable), junk: summary.junk.filter(usable) };
   summary.junkBytes = summary.junk.reduce((a, f) => a + f.size, 0);
-  duplicates = duplicates ? { ...duplicates, groups: duplicates.groups.filter((g) => !g.files.some((f) => blocked(f.rel))) } : duplicates;
+  duplicates = duplicates ? { ...duplicates, groups: duplicates.groups.filter((g) => g.files.every(usable)) } : duplicates;
   const ageDays = (f) => Math.round((now - f.mtimeMs) / 86400000);
-  const line = (f) => `${f.rel}\t${formatBytes(f.size)}\t${ageDays(f)} días`;
+  const tag = (f) => { const t = tierOf(f.rel); return `[${TIER_LABEL[t.tier] || t.tier}${t.owner ? `: ${t.owner}` : ''}]`; };
+  const line = (f) => `${f.rel}\t${formatBytes(f.size)}\t${ageDays(f)} días\t${tag(f)}`;
   const sections = [];
   sections.push(`Archivos más grandes:\n${summary.largest.slice(0, 40).map(line).join('\n') || '(ninguno)'}`);
   sections.push(`Grandes y sin modificar en +180 días:\n${summary.oldLarge.slice(0, 40).map(line).join('\n') || '(ninguno)'}`);
   sections.push(`Temporales / basura detectados (${summary.junk.length}, ${formatBytes(summary.junkBytes)}):\n${summary.junk.slice(0, 80).map(line).join('\n') || '(ninguno)'}`);
   const dupGroups = (duplicates?.groups || []).slice(0, 40);
-  const dupText = dupGroups.map((g, i) => `Grupo ${i + 1} (${formatBytes(g.size)} c/u):\n` + g.files.map((f) => `  ${f.rel}\t${ageDays(f)} días`).join('\n')).join('\n');
+  const dupText = dupGroups.map((g, i) => `Grupo ${i + 1} (${formatBytes(g.size)} c/u):\n` + g.files.map((f) => `  ${f.rel}\t${ageDays(f)} días\t${tag(f)}`).join('\n')).join('\n');
   sections.push(`Duplicados exactos (${duplicates?.groups?.length || 0} grupos, ${formatBytes(duplicates?.wastedBytes || 0)} recuperables):\n${dupText || '(ninguno)'}`);
   const user = `${describeFolder(summary)}\n\n${sections.join('\n\n')}\n\n` +
     (instructions.trim() ? `Instrucciones adicionales del usuario: ${instructions.trim()}\n\n` : '') +
@@ -153,7 +163,8 @@ function buildExplainMessages(rootAbs, items, { platform = process.platform, dri
   const osName = platform === 'win32' ? 'Windows' : platform === 'darwin' ? 'macOS' : 'Linux';
   const lines = items.map((it) => {
     const hint = it.hint ? ` | pista: ${it.hint.what} (borrar: ${it.hint.del}, mover: ${it.hint.move})` : '';
-    return `${it.path}\t${formatBytes(it.size)}\t${it.isDir ? `carpeta, ${it.fileCount} archivos` : 'archivo'}\t${it.kind}${hint}`;
+    const own = it.tier ? ` [${TIER_LABEL[it.tier] || it.tier}${it.owner ? `: ${it.owner}` : ''}]` : '';
+    return `${it.path}\t${formatBytes(it.size)}\t${it.isDir ? `carpeta, ${it.fileCount} archivos` : 'archivo'}\t${it.kind}${own}${hint}`;
   }).join('\n');
   const driveText = drives.length ? `Discos del equipo: ${drives.map((d) => `${d.name} (${d.path}) ${formatBytes(d.free)} libres de ${formatBytes(d.total)}`).join('; ')}.` : '';
   const user = `Sistema: ${osName}. Carpeta analizada: ${rootAbs}.\n${driveText}\n\nElementos (ruta\ttamaño\ttipo\tclase | pista):\n${lines}\n\nGenera el JSON.`;
@@ -286,12 +297,14 @@ function fileLookup(scan) {
   return byRel;
 }
 
-function buildCleanupPlan(aiJson, scan, duplicates, { isProtected: extra = null } = {}) {
+function buildCleanupPlan(aiJson, scan, duplicates, { isProtected: extra = null, tierOf = null, includeAppData = false } = {}) {
   const byRel = fileLookup(scan);
   const seen = new Set();
   const suggestions = [];
   const rejected = [];
   const blocked = (rel) => isProtected(rel) || (extra ? extra(rel) : false);
+  const tierInfo = (rel) => (tierOf ? tierOf(rel) : { tier: 'otro', owner: null });
+  const dupRels = new Set((duplicates?.groups || []).flatMap((g) => g.files.slice(1).map((f) => f.rel)));
   const keepers = new Set((duplicates?.groups || []).map((g) => g.files[0].rel));
   const allowedConf = new Set(['alta', 'media', 'baja']);
 
@@ -302,28 +315,40 @@ function buildCleanupPlan(aiJson, scan, duplicates, { isProtected: extra = null 
     if (!file) { rejected.push({ path: rel, reason: 'No existe en el análisis' }); continue; }
     if (seen.has(rel)) continue;
     if (blocked(rel)) { rejected.push({ path: rel, reason: 'Carpeta protegida' }); continue; }
+    const info = tierInfo(rel);
+    if (info.tier === 'sistema') { rejected.push({ path: rel, reason: 'Sistema' }); continue; }
+    if (info.tier === 'aplicacion' && !includeAppData && !dupRels.has(rel)) { rejected.push({ path: rel, reason: `Datos de ${info.owner || 'una aplicación'}` }); continue; }
     seen.add(rel);
-    const confidence = allowedConf.has(String(s.confidence).toLowerCase()) ? String(s.confidence).toLowerCase() : 'baja';
+    const asked = allowedConf.has(String(s.confidence).toLowerCase()) ? String(s.confidence).toLowerCase() : 'baja';
+    const cap = maxConfidence({ tier: info.tier, category: file.category, isDuplicate: dupRels.has(rel), junk: file.junk });
+    const confidence = capConfidence(asked, cap) || 'baja';
+    let reason = String(s.reason || '');
+    if (info.tier === 'aplicacion') reason = `Pertenece a ${info.owner || 'una aplicación'}: bórralo solo si sabes lo que haces. ${reason}`;
     suggestions.push({
       path: rel,
       size: file.size,
       mtimeMs: file.mtimeMs,
       category: file.category,
-      reason: String(s.reason || ''),
+      reason,
       confidence,
       kind: String(s.kind || 'otro'),
       duplicateKeeper: keepers.has(rel),
+      tier: info.tier,
+      owner: info.owner,
     });
   }
   // Ensure every duplicate group has all-but-one copy present even if the AI missed it.
   for (const g of duplicates?.groups || []) {
-    if (g.files.some((f) => blocked(f.rel))) continue;
+    if (g.files.some((f) => blocked(f.rel) || tierInfo(f.rel).tier === 'sistema')) continue;
+    if (!includeAppData && g.files.some((f) => tierInfo(f.rel).tier === 'aplicacion')) continue;
     for (const f of g.files.slice(1)) {
       if (seen.has(f.rel)) continue;
       seen.add(f.rel);
+      const info = tierInfo(f.rel);
       suggestions.push({
         path: f.rel, size: f.size, mtimeMs: f.mtimeMs, category: f.category,
-        reason: `Copia idéntica de "${g.files[0].rel}"`, confidence: 'alta', kind: 'duplicado', duplicateKeeper: false,
+        reason: `Copia idéntica de "${g.files[0].rel}"`, confidence: info.tier === 'aplicacion' ? 'baja' : 'alta', kind: 'duplicado', duplicateKeeper: false,
+        tier: info.tier, owner: info.owner,
       });
     }
   }
@@ -334,7 +359,7 @@ function buildCleanupPlan(aiJson, scan, duplicates, { isProtected: extra = null 
     suggestions,
     rejected,
     totalBytes: suggestions.reduce((s, x) => s + x.size, 0),
-    emptyDirs: scan.dirs.filter((d) => d.empty && d.rel !== '' && !blocked(d.rel)).map((d) => d.rel).slice(0, 5000),
+    emptyDirs: scan.dirs.filter((d) => d.empty && d.rel !== '' && !blocked(d.rel) && !['sistema', 'aplicacion'].includes(d.tier || 'otro')).map((d) => d.rel).slice(0, 5000),
   };
 }
 

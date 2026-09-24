@@ -156,3 +156,39 @@ test('cleanup plan and prompt exclude protected paths', () => {
   assert.ok(!plan.emptyDirs.includes('Windows/vacia'));
   assert.ok(plan.emptyDirs.includes('vacia'));
 });
+
+test('cleanup plan enforces ownership tiers and confidence caps', () => {
+  const app = file('AppData/Local/JuegoX/data.pak', 5e9, 300);
+  const cache = file('AppData/Local/JuegoX/Cache/c.bin', 1e8, 10);
+  const photo = file('Pictures/boda.jpg', 3e6, 800, { category: 'Imágenes' });
+  const s2 = { ...scan, files: [...scan.files, app, cache, photo] };
+  s2.stats = { ...scan.stats, largest: [app, cache, photo, ...scan.stats.largest], junk: [cache] };
+  const tierOf = (rel) => rel.startsWith('AppData/Local/JuegoX/Cache') ? { tier: 'cache', owner: 'JuegoX' } : rel.startsWith('AppData') ? { tier: 'aplicacion', owner: 'JuegoX' } : { tier: 'usuario', owner: null };
+  const ai = { suggestions: [
+    { path: 'AppData/Local/JuegoX/data.pak', confidence: 'alta', reason: 'grande' },
+    { path: 'AppData/Local/JuegoX/Cache/c.bin', confidence: 'alta', reason: 'caché' },
+    { path: 'Pictures/boda.jpg', confidence: 'alta', reason: 'vieja' },
+    { path: 'setup.exe', confidence: 'alta', reason: 'instalador' },
+  ] };
+  const plan = planner.buildCleanupPlan(ai, s2, null, { tierOf });
+  const by = Object.fromEntries(plan.suggestions.map((x) => [x.path, x]));
+  assert.equal(by['AppData/Local/JuegoX/data.pak'], undefined, 'app data must be dropped by default');
+  assert.match(plan.rejected.find((r) => r.path === 'AppData/Local/JuegoX/data.pak').reason, /JuegoX/);
+  assert.equal(by['AppData/Local/JuegoX/Cache/c.bin'].confidence, 'alta');
+  assert.equal(by['AppData/Local/JuegoX/Cache/c.bin'].tier, 'cache');
+  assert.equal(by['Pictures/boda.jpg'].confidence, 'media', 'personal photos are capped at media');
+  assert.equal(by['setup.exe'].confidence, 'alta');
+
+  const advanced = planner.buildCleanupPlan(ai, s2, null, { tierOf, includeAppData: true });
+  const appSug = advanced.suggestions.find((x) => x.path === 'AppData/Local/JuegoX/data.pak');
+  assert.equal(appSug.confidence, 'baja');
+  assert.match(appSug.reason, /Pertenece a JuegoX/);
+  assert.equal(appSug.owner, 'JuegoX');
+
+  const sum = summarize(s2);
+  const msgs = planner.buildCleanupMessages(sum, null, { tierOf });
+  assert.doesNotMatch(msgs[1].content, /data\.pak/, 'app data is not even offered to the model by default');
+  assert.match(msgs[1].content, /\[caché: JuegoX\]/);
+  const msgsAdv = planner.buildCleanupMessages(sum, null, { tierOf, includeAppData: true });
+  assert.match(msgsAdv.content ?? msgsAdv[1].content, /\[aplicación: JuegoX\]/);
+});

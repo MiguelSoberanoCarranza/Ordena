@@ -7,7 +7,9 @@ const { ScanCache } = require('./cache');
 const { filterFiles } = require('./query');
 const planner = require('./planner');
 const minimax = require('./minimax');
-const { Journal, applyMoves, undoMoves, trashFiles, removeEmptyDirs, relocate, undoRelocate } = require('./operations');
+const { Journal, applyMoves, undoMoves, trashFiles, removeEmptyDirs, relocate, undoRelocate, quarantineFiles, restoreQuarantine, purgeQuarantine } = require('./operations');
+const safety = require('./safety');
+const fsp = require('fs/promises');
 const { Settings } = require('./settings');
 const diskinfo = require('./diskinfo');
 const { resolveInside } = require('./paths');
@@ -158,6 +160,50 @@ function relProtected(scan, rel) {
   return diskinfo.isProtectedAbs(abs) || planner.isProtected(clean);
 }
 
+/** Ownership tier/owner for a scan-relative path (directory record of the file's folder). */
+function tierOfRel(scan, rel) {
+  const clean = String(rel || '').replace(/\\/g, '/');
+  const index = scan.index && scan.index.size === scan.dirs.length ? scan.index : new Map(scan.dirs.map((d) => [d.rel, d]));
+  scan.index = index;
+  let node = index.get(clean);
+  if (!node) node = index.get(clean.includes('/') ? clean.slice(0, clean.lastIndexOf('/')) : '');
+  if (node && node.tier) return { tier: node.tier, owner: node.owner || null };
+  const abs = clean ? path.join(scan.root, ...clean.split('/')) : scan.root;
+  const c = safety.classify(abs);
+  return { tier: c.tier, owner: c.owner };
+}
+
+/** Quarantine folder on the same volume as `abs` (so moving there is an instant rename). */
+async function quarantineDirFor(abs) {
+  const userData = app.getPath('userData');
+  const sameVolume = async (a, b) => {
+    if (process.platform === 'win32') return path.parse(a).root.toLowerCase() === path.parse(b).root.toLowerCase();
+    try { return (await fsp.stat(a)).dev === (await fsp.stat(b)).dev; } catch { return false; }
+  };
+  if (await sameVolume(abs, userData)) return path.join(userData, 'Cuarentena');
+  if (process.platform === 'win32') return path.join(path.parse(abs).root, 'Ordena Cuarentena');
+  if (process.platform === 'darwin' && abs.startsWith('/Volumes/')) return path.join('/Volumes', abs.split('/')[2], '.ordena-cuarentena');
+  return path.join(path.parse(abs).root, '.ordena-cuarentena');
+}
+
+/** Delete helper honouring the configured mode: Ordena quarantine (default) or the system trash. */
+async function deletePaths(scan, rels, kind) {
+  const s = await settings.load();
+  state.opsCancel = false;
+  const common = {
+    journal,
+    isProtected: (abs) => diskinfo.isProtectedAbs(abs),
+    shouldCancel: () => state.opsCancel,
+    onProgress: (p) => send('ops:progress', { ...p, kind }),
+  };
+  if (s.deleteMode === 'trash') {
+    const r = await trashFiles(scan.root, rels, { ...common, trashImpl: (abs) => shell.trashItem(abs) });
+    return { ...r, mode: 'trash' };
+  }
+  const r = await quarantineFiles(scan.root, rels, { ...common, quarantineDirFor, trashImpl: (abs) => shell.trashItem(abs) });
+  return { ...r, mode: 'quarantine' };
+}
+
 /** Recompute summary after an in-memory or on-disk change and persist the scan in the background. */
 function afterMutation() {
   if (!state.scan) return null;
@@ -258,13 +304,16 @@ handle('scan:cancel', async () => { state.scanCancel = true; return true; });
 function enrichEntry(scan, e, isDir) {
   const abs = e.rel ? path.join(scan.root, ...e.rel.split('/')) : scan.root;
   const hint = diskinfo.describePath(abs);
+  const own = isDir && e.tier ? { tier: e.tier, owner: e.owner || null } : tierOfRel(scan, e.rel || '');
   return {
     ...e,
     isDir,
     abs,
     kind: hint ? hint.kind : (isDir ? diskinfo.guessKind(abs) : (e.junk ? 'temporal' : e.category)),
     hint,
-    protected: diskinfo.isProtectedAbs(abs) || planner.isProtected(e.rel || ''),
+    tier: own.tier,
+    owner: own.owner,
+    protected: diskinfo.isProtectedAbs(abs) || planner.isProtected(e.rel || '') || own.tier === 'sistema',
   };
 }
 
@@ -275,7 +324,7 @@ handle('scan:children', async (rel) => {
   return {
     ...level,
     abs: level.rel ? path.join(scan.root, ...level.rel.split('/')) : scan.root,
-    dirs: level.dirs.map((d) => enrichEntry(scan, d, true)),
+    dirs: level.dirs.map((d) => { const rec = scan.index?.get(d.rel); return enrichEntry(scan, { ...d, tier: rec?.tier, owner: rec?.owner }, true); }),
     files: level.files.map((f) => enrichEntry(scan, f, false)),
   };
 });
@@ -307,7 +356,7 @@ handle('ai:explain', async (rels) => {
     const f = d ? null : [...scan.files, ...scan.stats.largest].find((x) => x.rel === rel);
     if (!d && !f) continue;
     const e = enrichEntry(scan, d || f, Boolean(d));
-    items.push({ path: e.abs, rel, size: e.size, isDir: Boolean(d), fileCount: d ? d.fileCount : 1, kind: e.kind, hint: e.hint });
+    items.push({ path: e.abs, rel, size: e.size, isDir: Boolean(d), fileCount: d ? d.fileCount : 1, kind: e.kind, hint: e.hint, tier: e.tier, owner: e.owner });
   }
   const drives = await diskinfo.listDrives().catch(() => []);
   const messages = planner.buildExplainMessages(scan.root, items, { drives });
@@ -345,14 +394,11 @@ handle('ops:relocate', async (rel, destDir, options = {}) => {
 handle('ops:trashPath', async (rel) => {
   const scan = requireScan();
   const abs = resolveInside(scan.root, rel);
-  if (diskinfo.isProtectedAbs(abs) || planner.isProtected(rel)) throw new Error('Esta ruta es del sistema y no se puede eliminar.');
-  const st = await require('fs/promises').stat(abs);
-  const node = st.isDirectory() ? scan.dirs.find((d) => d.rel === rel) : null;
-  const bytes = node ? node.size : st.size;
-  await shell.trashItem(abs);
-  await journal.append({ id: require('crypto').randomUUID(), type: 'trash', root: scan.root, at: new Date().toISOString(), count: node ? node.fileCount : 1, bytes, entries: [{ path: rel }], undone: false });
+  if (diskinfo.isProtectedAbs(abs) || planner.isProtected(rel) || tierOfRel(scan, rel).tier === 'sistema') throw new Error('Esta ruta es del sistema y no se puede eliminar.');
+  const result = await deletePaths(scan, [String(rel)], 'trash');
+  if (result.failed.length) throw new Error(result.failed[0].error);
   removeSubtree(scan, rel);
-  return { bytes, summary: afterMutation() };
+  return { bytes: result.bytes, mode: result.mode, summary: afterMutation() };
 });
 
 handle('scan:duplicates', async () => {
@@ -387,10 +433,13 @@ handle('ai:cleanup', async (options = {}) => {
     state.duplicates = { ...dupes, groups: dupes.groups.slice(0, 500) };
   }
   const guard = (rel) => relProtected(scan, rel);
-  const messages = planner.buildCleanupMessages(state.summary, state.duplicates, { instructions: options.instructions || '', isProtected: guard });
+  const sett = await settings.load();
+  const includeAppData = Boolean(options.includeAppData ?? sett.includeAppData);
+  const tierOf = (rel) => tierOfRel(scan, rel);
+  const messages = planner.buildCleanupMessages(state.summary, state.duplicates, { instructions: options.instructions || '', isProtected: guard, tierOf, includeAppData });
   const res = await runAi(messages, { maxTokens: 12000 });
   const json = minimax.extractJson(res.rawContent);
-  const plan = planner.buildCleanupPlan(json, scan, state.duplicates, { isProtected: guard });
+  const plan = planner.buildCleanupPlan(json, scan, state.duplicates, { isProtected: guard, tierOf, includeAppData });
   state.cleanupPlan = plan;
   return { plan, usage: res.usage, model: res.model, duplicates: state.duplicates };
 });
@@ -428,14 +477,10 @@ handle('ops:applyMoves', async (moves) => {
 handle('ops:trash', async (paths) => {
   const scan = requireScan();
   if (!Array.isArray(paths) || paths.length === 0) throw new Error('No hay archivos seleccionados');
-  state.opsCancel = false;
-  const result = await trashFiles(scan.root, paths.map(String), {
-    journal,
-    trashImpl: (abs) => shell.trashItem(abs),
-    isProtected: (abs) => diskinfo.isProtectedAbs(abs),
-    shouldCancel: () => state.opsCancel,
-    onProgress: (p) => send('ops:progress', { ...p, kind: 'trash' }),
-  });
+  const rels = paths.map(String);
+  const blockedRel = rels.find((r) => tierOfRel(scan, r).tier === 'sistema' || relProtected(scan, r));
+  if (blockedRel) throw new Error(`"${blockedRel}" pertenece al sistema y no se puede eliminar.`);
+  const result = await deletePaths(scan, rels, 'trash');
   removeMany(scan, result.done.map((d) => d.path));
   return { ...result, summary: afterMutation() };
 });
@@ -454,11 +499,43 @@ handle('ops:removeEmptyDirs', async (dirs) => {
 
 handle('ops:journal', async () => (await journal.read()).slice().reverse());
 
+handle('ops:purge', async (id) => {
+  const entries = await journal.read();
+  const entry = entries.find((e) => e.id === id);
+  if (!entry || entry.type !== 'quarantine') throw new Error('Operación no encontrada');
+  if (entry.purged) return { bytes: 0 };
+  return purgeQuarantine(entry, { journal });
+});
+
+handle('ops:purgeAll', async () => {
+  const entries = await journal.read();
+  let bytes = 0;
+  for (const e of entries) {
+    if (e.type === 'quarantine' && !e.purged && !e.undone) bytes += (await purgeQuarantine(e, { journal })).bytes;
+  }
+  return { bytes };
+});
+
+handle('ops:quarantineStatus', async () => {
+  const entries = await journal.read();
+  const pending = entries.filter((e) => e.type === 'quarantine' && !e.purged && !e.undone);
+  return { count: pending.length, bytes: pending.reduce((a, e) => a + (e.bytes || 0), 0), oldest: pending.length ? pending[0].at : null };
+});
+
 handle('ops:undo', async (id) => {
   const entries = await journal.read();
   const entry = entries.find((e) => e.id === id);
   if (!entry) throw new Error('Operación no encontrada');
   if (entry.undone) throw new Error('Esta operación ya fue deshecha');
+  if (entry.type === 'quarantine') {
+    if (entry.purged) throw new Error('Esta cuarentena ya se vació; los archivos se eliminaron definitivamente.');
+    const r = await restoreQuarantine(entry, { journal, onProgress: (p) => send('ops:progress', { ...p, kind: 'restore' }) });
+    if (state.scan && state.scan.root === entry.root) {
+      await refreshAffected(state.scan, r.restored.map((x) => x.to));
+      afterMutation();
+    }
+    return { restored: r.restored, failed: r.failed, inTrash: r.inTrash, summary: state.summary };
+  }
   if (entry.type === 'relocate') {
     const r = await undoRelocate(entry, { journal, onProgress: (p) => send('ops:progress', { ...p, kind: 'relocate' }) });
     let needsRescan = true;
